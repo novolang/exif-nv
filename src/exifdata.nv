@@ -1,0 +1,373 @@
+// exifdata.nv — the parsed metadata: five directories of entries, and
+// a thumbnail that is a span rather than a copy.
+//
+// A SPAN AND NOT A COPY
+//
+// The thumbnail in a photograph is typically 10 to 40 kilobytes of
+// JPEG.  A reader that copied it out would allocate that for every
+// file it looked at, including the overwhelming majority of callers
+// that wanted the exposure time and nothing else.
+//
+// So `ExifSpan` is a start and a length into the buffer the CALLER
+// still owns, and `exifdata.thumbnail_bytes` is the one line that
+// copies it out when a caller actually wants it.  The same shape works
+// for the MakerNote, which is larger still and which almost no caller
+// can interpret.
+//
+// EVERY ENTRY SURVIVES, KNOWN OR NOT
+//
+// An `ExifEntry` carries its tag number, its declared type and its
+// value whether or not the tag table has heard of it.  A private tag,
+// a vendor's tag and a tag from a newer EXIF than this table all round
+// trip.  A library that dropped what it did not recognise would
+// destroy metadata every time a file was saved, which is the worst
+// thing an EXIF library can do and is something several of them do.
+//
+// THE REPORT IS BESIDE THE DATA, NOT INSTEAD OF IT
+//
+// Real files have entries whose type disagrees with the specification
+// and counts that disagree with it.  `ExifReport` carries those
+// findings alongside the data that was read anyway, so that a viewer
+// ignores them and a validator prints them, and neither has to choose
+// between "read the file" and "know what was wrong with it".
+
+use exifvalue
+use exiforient
+
+// A range of bytes in the buffer the caller owns.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     println("${ExifSpan { start: 1024, length: 8192 }.length}")   // 8192
+// ```
+pub struct ExifSpan
+    // The first byte's offset, from the start of the buffer that was
+    // read — the whole JPEG, PNG or TIFF, not the EXIF block inside
+    // it, so a caller can slice without adding anything.
+    start: Int
+    // How many bytes.
+    length: Int
+
+// One directory entry.
+pub struct ExifEntry
+    // Which directory it was in.
+    ifd: ExifIfd
+    // The tag number, whether or not the table knows it.
+    tag: Int
+    // The type the FILE declared, which may not be the type the
+    // specification says the tag has.  A mismatch is a finding, and
+    // this is what the file actually said.
+    declared_type: ExifType
+    // The value, read according to the declared type.
+    value: ExifValue
+    // Where the entry's twelve bytes sat, for a message that can quote
+    // the file.
+    offset: Int
+
+// Everything read from one container.
+pub struct ExifData
+    // Which end of a multi-byte number comes first.  Carried because a
+    // rewrite must keep it: a file that was `MM` and comes back `II`
+    // is a file whose MakerNote's internal offsets no longer parse.
+    byte_order: ExifByteOrder
+    // Every entry of every directory, in the order they were read.
+    entries: [ExifEntry]
+    // Where the thumbnail's bytes are, or `None`.
+    thumbnail: ?ExifSpan
+    // Where the whole TIFF structure sat inside the container, which
+    // is what every offset inside it is relative to.
+    tiff_span: ExifSpan
+
+// What was read, and what was wrong with it.
+pub struct ExifReport
+    // The data, read as far as it could be.
+    data: ExifData
+    // Every non-fatal finding: a type that disagreed with the table, a
+    // count that disagreed, a zero denominator, an offset that pointed
+    // outside the block.
+    findings: [ExifFault]
+
+// How many entries were read.
+//
+// ```novo
+// use std.list
+// use exifdata
+//
+// fn main() [io]
+//     println("${list.len(exifdata.empty(ExifLittleEndian).entries)}")   // 0
+// ```
+pub fn entry_count(d: ExifData) -> Int []
+    todo("exif-nv.exifdata.entry_count")
+
+// Metadata with nothing in it, in a byte order of the caller's
+// choosing.
+//
+// What a writer starts from when it is adding EXIF to a file that had
+// none.
+//
+// ```novo
+// use exifdata
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.byte_order_mark(exifdata.empty(ExifBigEndian).byte_order))
+// ```
+pub fn empty(order: ExifByteOrder) -> ExifData []
+    todo("exif-nv.exifdata.empty")
+
+// Every entry in one directory, in ascending tag order.
+//
+// ```novo
+// use std.list
+// use exifdata
+//
+// fn main() [io]
+//     println("${list.len(exifdata.entries_in(exifdata.empty(ExifLittleEndian), ExifIfdGps))}")
+// ```
+pub fn entries_in(d: ExifData, i: ExifIfd) -> [ExifEntry] []
+    todo("exif-nv.exifdata.entries_in")
+
+// One entry, or `None`.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     match exifdata.entry(exifdata.empty(ExifLittleEndian), ExifIfdPrimary, 0x0112)
+//         Some(_) => println("present")
+//         None    => println("absent")
+// ```
+pub fn entry(d: ExifData, i: ExifIfd, tag: Int) -> ?ExifEntry []
+    todo("exif-nv.exifdata.entry")
+
+// One entry's value, or `None`.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     match exifdata.value(exifdata.empty(ExifLittleEndian), ExifIfdExif, 0x829A)
+//         Some(_) => println("the exposure time is present")
+//         None    => println("absent")
+// ```
+pub fn value(d: ExifData, i: ExifIfd, tag: Int) -> ?ExifValue []
+    todo("exif-nv.exifdata.value")
+
+// Whether a directory has any entries at all.
+//
+// The cheap question a caller asks before it walks: most photographs
+// have no GPS IFD and no Interoperability IFD.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     println("${exifdata.has_ifd(exifdata.empty(ExifLittleEndian), ExifIfdGps)}")   // false
+// ```
+pub fn has_ifd(d: ExifData, i: ExifIfd) -> Bool []
+    todo("exif-nv.exifdata.has_ifd")
+
+// The same metadata with one entry set, replacing any entry with the
+// same tag in the same directory.
+//
+// ```novo
+// use exifdata
+// use exifvalue
+//
+// fn main() [io]
+//     let d = exifdata.set(exifdata.empty(ExifLittleEndian), ExifIfdPrimary, 0x0112,
+//                          ExifShorts([6]))
+//     println("${exifdata.entry_count(d)}")     // 1
+// ```
+pub fn set(d: ExifData, i: ExifIfd, tag: Int, v: ExifValue) -> ExifData []
+    todo("exif-nv.exifdata.set")
+
+// The same metadata with one entry removed.
+//
+// ```novo
+// use exifdata
+// use exifvalue
+//
+// fn main() [io]
+//     let d = exifdata.set(exifdata.empty(ExifLittleEndian), ExifIfdPrimary, 0x0112,
+//                          ExifShorts([6]))
+//     println("${exifdata.entry_count(exifdata.remove(d, ExifIfdPrimary, 0x0112))}")   // 0
+// ```
+pub fn remove(d: ExifData, i: ExifIfd, tag: Int) -> ExifData []
+    todo("exif-nv.exifdata.remove")
+
+// The orientation the file claims, or `ExifUpright` when it claims
+// none.
+//
+// THE ACCESSOR MOST CALLERS WANT, and the reason it is not
+// `?ExifOrientation`: a file with no orientation tag is upright, which
+// is what every viewer assumes, and making every caller write the
+// `??` would be making every caller write the same `??`.
+// `exifdata.has_orientation` is there for the few that need to tell
+// "absent" from "1".
+//
+// ```novo
+// use exifdata
+// use exiforient
+//
+// fn main() [io]
+//     println(exiforient.orientation_name(
+//         exifdata.orientation(exifdata.empty(ExifLittleEndian))))   // upright
+// ```
+pub fn orientation(d: ExifData) -> ExifOrientation []
+    todo("exif-nv.exifdata.orientation")
+
+// Whether the file carries an orientation tag at all.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     println("${exifdata.has_orientation(exifdata.empty(ExifLittleEndian))}")   // false
+// ```
+pub fn has_orientation(d: ExifData) -> Bool []
+    todo("exif-nv.exifdata.has_orientation")
+
+// The same metadata with the orientation set.
+//
+// ```novo
+// use exifdata
+// use exiforient
+//
+// fn main() [io]
+//     let d = exifdata.with_orientation(exifdata.empty(ExifLittleEndian), ExifRotate90)
+//     println("${exifdata.has_orientation(d)}")   // true
+// ```
+pub fn with_orientation(d: ExifData, o: ExifOrientation) -> ExifData []
+    todo("exif-nv.exifdata.with_orientation")
+
+// Where the thumbnail is, or `None`.
+//
+// A SPAN, not the bytes: a thumbnail is typically 10 to 40 kilobytes
+// and the overwhelming majority of callers wanted the exposure time.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     match exifdata.thumbnail_span(exifdata.empty(ExifLittleEndian))
+//         Some(s) => println("${s.length}")
+//         None    => println("no thumbnail")
+// ```
+pub fn thumbnail_span(d: ExifData) -> ?ExifSpan []
+    todo("exif-nv.exifdata.thumbnail_span")
+
+// The thumbnail's bytes, copied out of the caller's buffer.
+//
+// The one line a caller writes when it actually wants the picture.
+// `source` must be the same buffer the metadata was read from, because
+// the span's offsets are into it.
+//
+// ```novo
+// use std.bytes
+// use exifdata
+//
+// fn main() [io]
+//     let src = bytes.zeros(64)
+//     match exifdata.thumbnail_bytes(exifdata.empty(ExifLittleEndian), src)
+//         Some(t) => println("${bytes.len(t)}")
+//         None    => println("no thumbnail")
+// ```
+pub fn thumbnail_bytes(d: ExifData, source: Bytes) -> ?Bytes []
+    todo("exif-nv.exifdata.thumbnail_bytes")
+
+// Whether the thumbnail is JPEG, as opposed to uncompressed TIFF
+// strips.
+//
+// Tag 0x0103, `Compression`, in the 1st IFD: 6 is JPEG and 1 is
+// uncompressed.  Almost every file is the first; a caller that assumes
+// it and meets the second hands a TIFF strip to a JPEG decoder.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     println("${exifdata.thumbnail_is_jpeg(exifdata.empty(ExifLittleEndian))}")   // false
+// ```
+pub fn thumbnail_is_jpeg(d: ExifData) -> Bool []
+    todo("exif-nv.exifdata.thumbnail_is_jpeg")
+
+// Where the MakerNote is, or `None`.
+//
+// A span for the same reason the thumbnail is one, and because almost
+// no caller can interpret it: this package does not parse a MakerNote
+// and says so in the README.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     match exifdata.maker_note_span(exifdata.empty(ExifLittleEndian))
+//         Some(s) => println("${s.length}")
+//         None    => println("no maker note")
+// ```
+pub fn maker_note_span(d: ExifData) -> ?ExifSpan []
+    todo("exif-nv.exifdata.maker_note_span")
+
+// The GPS position as degrees, positive north and positive east, or
+// `None`.
+//
+// THE ONE DERIVED VALUE THIS PACKAGE COMPUTES, because getting it
+// right is four tags and two sign conventions: `GPSLatitude` is three
+// rationals of degrees, minutes and seconds, and `GPSLatitudeRef` is
+// `"N"` or `"S"` — the sign is in a SEPARATE tag, and a caller that
+// read the first and not the second puts every southern photograph in
+// the northern hemisphere.
+//
+// `None` when either pair of tags is absent, and the refusal when a
+// rational's denominator is zero.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     match exifdata.gps_degrees(exifdata.empty(ExifLittleEndian))
+//         Ok(p)  =>
+//             match p
+//                 Some(ll) => println("${ll.0}, ${ll.1}")
+//                 None     => println("no GPS tags")
+//         Err(e) => println(e.message())
+// ```
+pub fn gps_degrees(d: ExifData) -> Result<?(Float, Float), ExifFault> []
+    todo("exif-nv.exifdata.gps_degrees")
+
+// The date a tag holds, as the six numbers its fixed-width field
+// carries: year, month, day, hour, minute, second.
+//
+// NOT AN INSTANT.  EXIF 2.32 § 4.6.5 writes `DateTimeOriginal` as
+// `"YYYY:MM:DD HH:MM:SS"` with NO TIME ZONE, so the field does not
+// name a moment and cannot be converted to one without knowing where
+// the camera was.  EXIF 2.31 added `OffsetTimeOriginal` and almost
+// nothing writes it.  Handing back six numbers says exactly what the
+// file said; a caller that has an offset builds an instant with
+// chrono-nv.
+//
+// ```novo
+// use exifdata
+//
+// fn main() [io]
+//     match exifdata.date_fields(exifdata.empty(ExifLittleEndian), ExifIfdExif, 0x9003)
+//         Some(t) => println("${t.0}-${t.1}-${t.2}")
+//         None    => println("no date")
+// ```
+pub fn date_fields(d: ExifData, i: ExifIfd, tag: Int) -> ?(Int, Int, Int, Int, Int, Int) []
+    todo("exif-nv.exifdata.date_fields")
+
+// How many findings a report carries.
+//
+// ```novo
+// use std.list
+// use exifdata
+//
+// fn main() [io]
+//     println("${exifdata.finding_count(ExifReport { data: exifdata.empty(ExifLittleEndian), findings: [] })}")
+// ```
+pub fn finding_count(r: ExifReport) -> Int []
+    todo("exif-nv.exifdata.finding_count")

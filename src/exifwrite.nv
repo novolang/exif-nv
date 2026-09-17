@@ -1,0 +1,216 @@
+// exifwrite.nv — putting metadata back, and saying what it cost.
+//
+// A WRITE SAYS WHAT IT WILL LOSE BEFORE IT WRITES
+//
+// Rewriting EXIF is not a safe operation and every library that
+// pretends otherwise has destroyed somebody's photographs.  The two
+// things that go wrong:
+//
+//   - A MakerNote is a vendor's private structure inside an
+//     `UNDEFINED` field, and several vendors wrote ABSOLUTE offsets
+//     inside it — offsets into the original file.  Move the Exif IFD
+//     and the note points at nothing: the lens correction data, the
+//     focus points and the shooting mode are silently gone, and no
+//     error is raised anywhere.
+//   - A JPEG APP1 segment's length is two bytes, so 65533 is the hard
+//     ceiling on how much metadata a JPEG can carry.  A file with a
+//     large thumbnail is already near it, and adding a caption can
+//     push it over.
+//
+// So `plan` answers what a write WOULD do — whether the MakerNote
+// moves, how large the segment becomes, which entries are dropped —
+// and `write` does it.  A caller that has not looked at the plan is a
+// caller that has not been told.
+//
+// THE BYTE ORDER IS KEPT
+//
+// A file that was `MM` comes back `MM`.  Not for elegance: a MakerNote
+// holds its own numbers in the file's byte order, and a rewrite that
+// changed it would make the note unreadable even if nothing moved.
+
+use exifdata
+
+// What a write would do, computed before anything is written.
+//
+// ```novo
+// use exifwrite
+//
+// fn main() [io]
+//     println("${exifwrite.EXIF_JPEG_APP1_LIMIT}")   // 65533
+// ```
+pub struct ExifWritePlan
+    // How many bytes the EXIF block would occupy.
+    block_bytes: Int
+    // Whether that fits the container.  False for a JPEG whose APP1
+    // segment would exceed 65533 bytes.
+    fits: Bool
+    // Whether the file carries a MakerNote.
+    has_maker_note: Bool
+    // Whether that MakerNote would move.  TRUE IS THE WARNING: several
+    // vendors' notes hold absolute file offsets and stop parsing when
+    // they move.
+    maker_note_moves: Bool
+    // Whether the thumbnail would be kept.
+    keeps_thumbnail: Bool
+    // Tags that would be dropped, as `ifd, tag` pairs: entries whose
+    // value could not be read and therefore cannot be written back.
+    dropped: [(Int, Int)]
+
+// The largest an APP1 segment can be: the two-byte length field holds
+// 65535 and counts itself, and `Exif\0\0` takes six of what is left.
+pub const EXIF_JPEG_APP1_LIMIT = 65533
+
+// What writing this metadata into this container would do.
+//
+// ANSWERED BEFORE ANYTHING IS WRITTEN, so that a caller can refuse, or
+// drop the thumbnail, or tell its user, rather than finding out
+// afterwards.
+//
+// ```novo
+// use std.bytes
+// use exifdata
+// use exifread
+// use exifwrite
+//
+// fn main() [io]
+//     let d = exifdata.empty(ExifLittleEndian)
+//     match exifwrite.plan(bytes.zeros(64), d, ExifContainerJpeg)
+//         Ok(p)  => println("${p.block_bytes}")
+//         Err(e) => println(e.message())
+// ```
+pub fn plan(source: Bytes, d: ExifData, c: ExifContainer) -> Result<ExifWritePlan, ExifFault> []
+    todo("exif-nv.exifwrite.plan")
+
+// Whether a plan loses nothing: the MakerNote does not move, the
+// thumbnail is kept, nothing is dropped, and the block fits.
+//
+// The one-line question a tool asks before it saves over the original.
+//
+// ```novo
+// use std.bytes
+// use exifdata
+// use exifread
+// use exifwrite
+//
+// fn main() [io]
+//     match exifwrite.plan(bytes.zeros(64), exifdata.empty(ExifLittleEndian),
+//                          ExifContainerTiff)
+//         Ok(p)  => println("${exifwrite.is_lossless(p)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn is_lossless(p: ExifWritePlan) -> Bool []
+    todo("exif-nv.exifwrite.is_lossless")
+
+// The container's bytes with this metadata in place of whatever was
+// there.
+//
+// Everything outside the EXIF block is copied unchanged: the JPEG's
+// scan data, the PNG's other chunks, the TIFF's image strips.  The
+// byte order is the one in `d`, and a read-then-write keeps the file's
+// own.
+//
+// ```novo
+// use std.bytes
+// use exifdata
+// use exifread
+// use exifwrite
+//
+// fn main() [io]
+//     match exifwrite.write(bytes.zeros(64), exifdata.empty(ExifLittleEndian),
+//                           ExifContainerTiff)
+//         Ok(out) => println("${bytes.len(out)}")
+//         Err(e)  => println(e.message())
+// ```
+pub fn write(source: Bytes, d: ExifData, c: ExifContainer) -> Result<Bytes, ExifFault> []
+    todo("exif-nv.exifwrite.write")
+
+// The same, with the container sniffed rather than named.
+//
+// ```novo
+// use std.bytes
+// use exifdata
+// use exifwrite
+//
+// fn main() [io]
+//     match exifwrite.write_sniffed(bytes.zeros(64), exifdata.empty(ExifLittleEndian))
+//         Ok(out) => println("${bytes.len(out)}")
+//         Err(e)  => println(e.message())
+// ```
+pub fn write_sniffed(source: Bytes, d: ExifData) -> Result<Bytes, ExifFault> []
+    todo("exif-nv.exifwrite.write_sniffed")
+
+// The container's bytes with all EXIF removed.
+//
+// WHAT A PUBLISHING PIPELINE ACTUALLY WANTS, and it is a separate
+// function rather than `write` with empty metadata because the two are
+// different: writing empty metadata leaves an empty EXIF block, and
+// this removes the block, the segment and the chunk.  A file that has
+// been through this carries no camera serial number, no GPS position
+// and no thumbnail of an earlier crop.
+//
+// ```novo
+// use std.bytes
+// use exifwrite
+//
+// fn main() [io]
+//     match exifwrite.strip(bytes.zeros(64))
+//         Ok(out) => println("${bytes.len(out)}")
+//         Err(e)  => println(e.message())
+// ```
+pub fn strip(source: Bytes) -> Result<Bytes, ExifFault> []
+    todo("exif-nv.exifwrite.strip")
+
+// The container's bytes with only the orientation changed.
+//
+// The narrow write, and the one that is safe: it edits two bytes of an
+// existing entry in place, so nothing moves, the MakerNote is
+// untouched and the segment's length does not change.  It refuses when
+// the file has no orientation tag to edit, because adding one is a
+// rewrite and a rewrite is `write`.
+//
+// ```novo
+// use std.bytes
+// use exiforient
+// use exifwrite
+//
+// fn main() [io]
+//     match exifwrite.set_orientation(bytes.zeros(64), ExifUpright)
+//         Ok(out) => println("${bytes.len(out)}")
+//         Err(e)  => println(e.message())
+// ```
+pub fn set_orientation(source: Bytes, o: ExifOrientation) -> Result<Bytes, ExifFault> []
+    todo("exif-nv.exifwrite.set_orientation")
+
+// The TIFF structure on its own, with no container around it.
+//
+// What a caller writing its own container needs: the bytes that go
+// after `Exif\0\0` in a JPEG APP1 segment, or inside a PNG `eXIf`
+// chunk, or at the start of a TIFF.
+//
+// ```novo
+// use std.bytes
+// use exifdata
+// use exifwrite
+//
+// fn main() [io]
+//     match exifwrite.to_tiff_block(exifdata.empty(ExifLittleEndian))
+//         Ok(out) => println("${bytes.len(out) >= 8}")   // the header alone is eight
+//         Err(e)  => println(e.message())
+// ```
+pub fn to_tiff_block(d: ExifData) -> Result<Bytes, ExifFault> []
+    todo("exif-nv.exifwrite.to_tiff_block")
+
+// How many bytes the TIFF structure would occupy, without building it.
+//
+// What `plan` reports as `block_bytes`, available on its own for a
+// caller sizing a buffer or deciding whether a caption will fit.
+//
+// ```novo
+// use exifdata
+// use exifwrite
+//
+// fn main() [io]
+//     println("${exifwrite.block_size(exifdata.empty(ExifLittleEndian)) >= 8}")
+// ```
+pub fn block_size(d: ExifData) -> Int []
+    todo("exif-nv.exifwrite.block_size")

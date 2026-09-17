@@ -1,0 +1,141 @@
+// exiftag_tests.nv — the five directories and the tag table, against
+// EXIF 2.32 section 4.6 and TIFF 6.0 section 2.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: exif-nv.exiftag.<fn>`.
+
+use std.test
+use std.list
+use exiftag
+use exifvalue
+
+@test
+fn test_the_five_directories_are_named_as_the_specification_names_them() [io]
+    test.case("the 0th and 1st are numbered, the rest are named")
+    test.assert(exiftag.ifd_name(ExifIfdPrimary) == "0th")
+    test.assert(exiftag.ifd_name(ExifIfdThumbnail) == "1st")
+    test.assert(exiftag.ifd_name(ExifIfdExif) == "Exif")
+    test.assert(exiftag.ifd_name(ExifIfdGps) == "GPS")
+    test.assert(exiftag.ifd_name(ExifIfdInterop) == "Interoperability")
+
+@test
+fn test_three_directories_are_reached_through_a_tag_and_two_are_not() [io]
+    // Nesting through a tag is what makes EXIF a tree rather than a
+    // list, and is why every offset is relative to the TIFF header.
+    test.case("Exif is behind 0x8769, GPS behind 0x8825, Interop behind 0xA005")
+    match exiftag.pointer_tag_for(ExifIfdExif)
+        Some(n) => test.assert(n == exiftag.EXIF_TAG_EXIF_IFD)
+        None    => test.fail("the Exif IFD is reached through a tag")
+    match exiftag.pointer_tag_for(ExifIfdGps)
+        Some(n) => test.assert(n == 0x8825)
+        None    => test.fail("the GPS IFD is reached through a tag")
+    match exiftag.pointer_tag_for(ExifIfdInterop)
+        Some(n) => test.assert(n == 0xA005)
+        None    => test.fail("the Interoperability IFD is reached through a tag")
+
+    test.case("the 0th comes from the header and the 1st from the chain")
+    match exiftag.pointer_tag_for(ExifIfdPrimary)
+        Some(_) => test.fail("the 0th IFD is reached from the TIFF header")
+        None    => test.assert(true)
+    match exiftag.pointer_tag_for(ExifIfdThumbnail)
+        Some(_) => test.fail("the 1st IFD is the 0th's next-directory pointer")
+        None    => test.assert(true)
+
+    test.case("and the pointer is read back the other way")
+    match exiftag.ifd_behind_pointer(0x8769)
+        Some(i) => test.assert(exiftag.ifd_name(i) == "Exif")
+        None    => test.fail("0x8769 is the Exif IFD pointer")
+    match exiftag.ifd_behind_pointer(0x0112)
+        Some(_) => test.fail("Orientation is not a pointer")
+        None    => test.assert(true)
+
+@test
+fn test_a_tag_number_means_nothing_without_its_directory() [io]
+    // Tag 0x0001 is InteroperabilityIndex in the Interoperability IFD
+    // and GPSLatitudeRef in the GPS IFD.  A table keyed by number
+    // alone answers the wrong name for a GPS file.
+    test.case("0x0001 is two different tags in two directories")
+    test.assert(exiftag.name_at(ExifIfdGps, 0x0001) == "GPSLatitudeRef")
+    test.assert(exiftag.name_at(ExifIfdInterop, 0x0001) == "InteroperabilityIndex")
+
+    test.case("0x0112 is Orientation in the 0th and nothing in the Exif IFD")
+    test.assert(exiftag.is_known(ExifIfdPrimary, exiftag.EXIF_TAG_ORIENTATION))
+    test.assert(not exiftag.is_known(ExifIfdExif, exiftag.EXIF_TAG_ORIENTATION))
+
+    test.case("a tag carries the type the specification gives it")
+    match exiftag.tag_at(ExifIfdPrimary, 0x0112)
+        Some(t) =>
+            test.assert(t.name == "Orientation")
+            test.assert(exifvalue.type_name(t.expected_type) == "SHORT")
+            test.assert(t.expected_count == 1)
+        None    => test.fail("Orientation is in the table")
+
+    test.case("ExposureTime is a RATIONAL in the Exif IFD")
+    match exiftag.tag_at(ExifIfdExif, 0x829A)
+        Some(t) =>
+            test.assert(t.name == "ExposureTime")
+            test.assert(exifvalue.type_name(t.expected_type) == "RATIONAL")
+        None    => test.fail("ExposureTime is in the table")
+
+    test.case("GPSLatitude is three rationals")
+    match exiftag.tag_at(ExifIfdGps, 0x0004)
+        Some(t) => test.assert(t.expected_count == 3)
+        None    => test.fail("GPSLongitude is in the table")
+
+    test.case("and an open-ended count is stated as -1, not guessed")
+    match exiftag.tag_at(ExifIfdPrimary, 0x010E)
+        Some(t) => test.assert(t.expected_count == 0 - 1)
+        None    => test.fail("ImageDescription is in the table")
+
+@test
+fn test_a_tag_the_table_does_not_know_is_not_a_refusal() [io]
+    // A library that dropped what it did not recognise would destroy
+    // metadata every time a file was saved.
+    test.case("an unknown tag answers None")
+    match exiftag.tag_at(ExifIfdPrimary, 0x9999)
+        Some(_) => test.fail("0x9999 is not in the table")
+        None    => test.assert(true)
+
+    test.case("and its name prints as hexadecimal so a person can look it up")
+    test.assert(exiftag.name_at(ExifIfdPrimary, 0x9999) == "0x9999")
+
+    test.case("a name looks up its number")
+    match exiftag.tag_named(ExifIfdPrimary, "Orientation")
+        Some(t) => test.assert(t.number == 0x0112)
+        None    => test.fail("Orientation is in the table")
+    match exiftag.tag_named(ExifIfdPrimary, "NotATag")
+        Some(_) => test.fail("that is not a tag")
+        None    => test.assert(true)
+
+@test
+fn test_a_directorys_tags_come_back_in_the_order_a_file_writes_them() [io]
+    // TIFF 6.0 requires a directory's entries to be in ascending tag
+    // order, so a writer walks this list as it is.
+    test.case("every directory has tags")
+    test.assert(list.len(exiftag.tags_of(ExifIfdPrimary)) > 0)
+    test.assert(list.len(exiftag.tags_of(ExifIfdExif)) > 0)
+    test.assert(list.len(exiftag.tags_of(ExifIfdGps)) > 0)
+
+    test.case("the Interoperability IFD has two, which is all EXIF gives it")
+    test.assert(list.len(exiftag.tags_of(ExifIfdInterop)) == 2)
+
+    test.case("and the first tag number is the smallest")
+    test.assert(list.get(exiftag.tags_of(ExifIfdGps), 0).number == 0x0000)
+
+@test
+fn test_the_maker_note_is_marked_as_offset_fragile() [io]
+    // Several vendors wrote ABSOLUTE file offsets inside the note.
+    // Move it and the lens correction data, the focus points and the
+    // shooting mode are silently gone, with no error anywhere.
+    test.case("MakerNote is fragile")
+    test.assert(exiftag.is_offset_fragile(ExifIfdExif, exiftag.EXIF_TAG_MAKER_NOTE))
+
+    test.case("and an ordinary tag is not")
+    test.assert(not exiftag.is_offset_fragile(ExifIfdPrimary, 0x0112))
+    test.assert(not exiftag.is_offset_fragile(ExifIfdExif, 0x829A))
+
+    test.case("the thumbnail's offset and length tags are named as constants")
+    test.assert(exiftag.EXIF_TAG_THUMBNAIL_OFFSET == 0x0201)
+    test.assert(exiftag.EXIF_TAG_THUMBNAIL_LENGTH == 0x0202)
+    test.assert(exiftag.EXIF_TAG_INTEROP_IFD == 0xA005)
+    test.assert(exiftag.EXIF_TAG_GPS_IFD == 0x8825)

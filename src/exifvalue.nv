@@ -1,0 +1,412 @@
+// exifvalue.nv — the twelve TIFF types, and the two that must not be
+// turned into floating point.
+//
+// A RATIONAL IS TWO INTEGERS AND STAYS TWO INTEGERS
+//
+// TIFF type 5 is RATIONAL: two unsigned 32-bit integers, a numerator
+// and a denominator.  Type 10 is SRATIONAL, the signed form.  EXIF
+// uses them for the numbers a photographer reads: the exposure time,
+// the aperture, the focal length, every GPS coordinate.
+//
+// A library that hands back a `Float` has thrown away the fact that
+// the file said `1/250`.  It is not a rounding problem — 1/250 is
+// 0.004 and a program can print that — it is that `1/250` is what a
+// camera displays, what a photographer writes, and what the file
+// contains, and once it is a float nothing can get it back.  A shutter
+// speed of `10/2000` and one of `1/200` are the same number and
+// different files, and a tool that rewrites metadata must not silently
+// normalise one into the other.
+//
+// So `ExifRational` carries both integers, `exifvalue.to_float` is a
+// conversion the caller asks for by name, and `exifvalue.format_ratio`
+// is what prints `1/250`.
+//
+// A VALUE IS A LIST, BECAUSE EVERY ENTRY IS
+//
+// A TIFF directory entry carries a type AND a count, and the count is
+// often more than one: `BitsPerSample` is three shorts,
+// `GPSLatitude` is three rationals, `ComponentsConfiguration` is four
+// bytes.  There is no scalar case in the format, so there is no scalar
+// arm here — `ExifShorts` holds a list even when the list has one
+// element, and the accessors that want one element say so by name.
+//
+// ASCII IS NOT A STRING
+//
+// TIFF type 2 is ASCII: bytes with a trailing NUL, and the count
+// INCLUDES the NUL.  Files carry UTF-8 in it, they carry Shift JIS in
+// it, and they carry fields with no NUL at all.  `ExifAscii` therefore
+// holds the bytes, `exifvalue.ascii_text` is the lenient reading that
+// drops a trailing NUL and takes the rest as UTF-8, and a caller that
+// needs to know what it really was reads the bytes.
+
+// A TIFF 6.0 type code.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println("${exifvalue.type_code(ExifTypeRational)}")   // 5
+// ```
+pub enum ExifType
+    // 1: an unsigned byte.
+    ExifTypeByte
+    // 2: NUL-terminated bytes.  The count includes the NUL.
+    ExifTypeAscii
+    // 3: an unsigned 16-bit integer.
+    ExifTypeShort
+    // 4: an unsigned 32-bit integer.
+    ExifTypeLong
+    // 5: two unsigned 32-bit integers, a numerator and a denominator.
+    ExifTypeRational
+    // 6: a signed byte.  Defined by TIFF 6.0 and used by almost
+    // nothing.
+    ExifTypeSbyte
+    // 7: bytes with no interpretation.  What MakerNote and
+    // UserComment are.
+    ExifTypeUndefined
+    // 8: a signed 16-bit integer.
+    ExifTypeSshort
+    // 9: a signed 32-bit integer.
+    ExifTypeSlong
+    // 10: two signed 32-bit integers.
+    ExifTypeSrational
+    // 11: a 32-bit float.  Defined by TIFF 6.0 and not used by EXIF.
+    ExifTypeFloat
+    // 12: a 64-bit float.  Likewise.
+    ExifTypeDouble
+
+// Which end of a multi-byte number comes first.
+//
+// The TIFF header's first two bytes say which, and it applies to every
+// number in the structure INCLUDING the offsets.  `II` is Intel,
+// little-endian; `MM` is Motorola, big-endian.  Both are common: a
+// Canon writes `II` and a Nikon writes `MM`.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.byte_order_mark(ExifLittleEndian))   // II
+// ```
+pub enum ExifByteOrder
+    // `II`, 0x4949: least significant byte first.
+    ExifLittleEndian
+    // `MM`, 0x4D4D: most significant byte first.
+    ExifBigEndian
+
+// An unsigned rational: a numerator over a denominator, both as the
+// file stores them.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.format_ratio(ExifRational { numerator: 1, denominator: 250 }))
+// ```
+pub struct ExifRational
+    // The numerator, 0 to 4294967295.
+    numerator: Int
+    // The denominator, 0 to 4294967295.  Zero is legal in the file and
+    // is `ExifZeroDenominator` when a caller asks for the value.
+    denominator: Int
+
+// A signed rational.
+//
+// Used for exposure bias, brightness, and the shutter and aperture
+// values of the APEX system, all of which are meaningfully negative.
+pub struct ExifSrational
+    // The numerator, -2147483648 to 2147483647.
+    numerator: Int
+    // The denominator.
+    denominator: Int
+
+// One directory entry's value.
+//
+// Every arm holds a LIST, because a TIFF entry carries a count and the
+// count is often more than one.  There is no scalar case in the
+// format, so there is none here.
+//
+// ```novo
+// use std.list
+// use exifvalue
+//
+// fn main() [io]
+//     match ExifShorts([72, 72])
+//         ExifShorts(xs) => println("${list.len(xs)}")   // 2
+//         _              => println("some other type")
+// ```
+pub enum ExifValue
+    // Type 1 or 7: bytes, uninterpreted.
+    ExifBytes(data: Bytes)
+    // Type 2: the field's bytes, trailing NUL included if the file
+    // wrote one.
+    ExifAscii(data: Bytes)
+    // Type 3: unsigned 16-bit integers.
+    ExifShorts(values: [Int])
+    // Type 4: unsigned 32-bit integers.
+    ExifLongs(values: [Int])
+    // Type 5: unsigned rationals.
+    ExifRationals(values: [ExifRational])
+    // Type 6, 8 or 9: signed integers.
+    ExifSigneds(values: [Int])
+    // Type 10: signed rationals.
+    ExifSrationals(values: [ExifSrational])
+    // Type 11 or 12: floating point.  Declared by TIFF 6.0, used by no
+    // EXIF tag, and carried so that a file that uses one is read
+    // rather than refused.
+    ExifFloats(values: [Float])
+
+// The type's numeric code, 1 to 12.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println("${exifvalue.type_code(ExifTypeAscii)}")   // 2
+// ```
+pub fn type_code(t: ExifType) -> Int []
+    todo("exif-nv.exifvalue.type_code")
+
+// The type a code names, or `None` for a code outside 1 to 12.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     match exifvalue.type_from_code(13)
+//         Some(_) => println("this cannot happen — TIFF 6.0 defines twelve")
+//         None    => println("not a TIFF type")
+// ```
+pub fn type_from_code(code: Int) -> ?ExifType []
+    todo("exif-nv.exifvalue.type_from_code")
+
+// How many bytes one element of this type takes: 1, 2, 4 or 8.
+//
+// The number an entry's length is `count * this`, and the number that
+// decides whether a value fits the four bytes a directory entry has
+// for it or needs an offset.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println("${exifvalue.type_size(ExifTypeRational)}")   // 8
+//     println("${exifvalue.type_size(ExifTypeShort)}")      // 2
+// ```
+pub fn type_size(t: ExifType) -> Int []
+    todo("exif-nv.exifvalue.type_size")
+
+// The type's name: `"BYTE"`, `"ASCII"`, `"SHORT"`, and the rest, in
+// TIFF 6.0's own spelling.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.type_name(ExifTypeSrational))   // SRATIONAL
+// ```
+pub fn type_name(t: ExifType) -> Str []
+    todo("exif-nv.exifvalue.type_name")
+
+// The two-byte mark a byte order writes: `"II"` or `"MM"`.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.byte_order_mark(ExifBigEndian))   // MM
+// ```
+pub fn byte_order_mark(o: ExifByteOrder) -> Str []
+    todo("exif-nv.exifvalue.byte_order_mark")
+
+// The byte order a mark names, or `ExifBadByteOrder`.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     match exifvalue.byte_order_from_mark(0x4949)
+//         Ok(o)  => println(exifvalue.byte_order_mark(o))   // II
+//         Err(e) => println(e.message())
+// ```
+pub fn byte_order_from_mark(mark: Int) -> Result<ExifByteOrder, ExifFault> []
+    todo("exif-nv.exifvalue.byte_order_from_mark")
+
+// The type a value is.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.type_name(exifvalue.type_of(ExifShorts([72]))))   // SHORT
+// ```
+pub fn type_of(v: ExifValue) -> ExifType []
+    todo("exif-nv.exifvalue.type_of")
+
+// How many elements a value holds — the entry's count field.
+//
+// For `ExifAscii` this is the byte length INCLUDING the trailing NUL,
+// which is what TIFF 6.0 says the count is and what a rewrite has to
+// put back.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println("${exifvalue.count_of(ExifShorts([72, 72]))}")   // 2
+// ```
+pub fn count_of(v: ExifValue) -> Int []
+    todo("exif-nv.exifvalue.count_of")
+
+// A rational, spelled `numerator/denominator`: `"1/250"`, `"56/10"`.
+//
+// WHAT A PHOTOGRAPHER READS.  It does not reduce the fraction, because
+// `10/2000` and `1/200` are the same number and different files, and a
+// tool that rewrites metadata must not silently normalise one into the
+// other.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.format_ratio(ExifRational { numerator: 10, denominator: 2000 }))
+// ```
+pub fn format_ratio(r: ExifRational) -> Str []
+    todo("exif-nv.exifvalue.format_ratio")
+
+// A rational as a floating point number, or `ExifZeroDenominator`.
+//
+// ASKED FOR BY NAME.  A refusal rather than an infinity, because the
+// exposure time a caller is about to print is not a number and saying
+// so is more useful than printing `inf`.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     match exifvalue.to_float(ExifRational { numerator: 1, denominator: 0 })
+//         Ok(_)  => println("this cannot happen")
+//         Err(e) => println(e.message())
+// ```
+pub fn to_float(r: ExifRational) -> Result<Float, ExifFault> []
+    todo("exif-nv.exifvalue.to_float")
+
+// A signed rational as a floating point number, or
+// `ExifZeroDenominator`.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     match exifvalue.srational_to_float(ExifSrational { numerator: 0 - 3, denominator: 10 })
+//         Ok(f)  => println("${f}")             // -0.3
+//         Err(e) => println(e.message())
+// ```
+pub fn srational_to_float(r: ExifSrational) -> Result<Float, ExifFault> []
+    todo("exif-nv.exifvalue.srational_to_float")
+
+// The rational a decimal number is closest to, with a denominator no
+// larger than `max_denominator`.
+//
+// WHAT A WRITER NEEDS.  A caller setting a GPS coordinate has degrees
+// as a number and the file wants two integers, and the obvious
+// conversion — multiply by a million and round — writes
+// `123456789/1000000` where a camera would have written `37/1`.  This
+// is the continued-fraction convergent, which is what gets the short
+// spelling.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.ratio_from_float(0.004, 1000))   // 1/250
+// ```
+pub fn ratio_from_float(value: Float, max_denominator: Int) -> ExifRational []
+    todo("exif-nv.exifvalue.ratio_from_float")
+
+// An ASCII field's text: the bytes with one trailing NUL dropped,
+// taken as UTF-8.
+//
+// LENIENT ON PURPOSE.  TIFF 6.0 says the field is ASCII and the count
+// includes the NUL; real files carry UTF-8, Shift JIS, and fields with
+// no NUL at all.  Refusing them would refuse the camera model of a
+// large share of the photographs in the world.  A caller that needs to
+// know what the bytes really were reads them from the `ExifAscii` arm.
+//
+// ```novo
+// use std.bytes
+// use exifvalue
+//
+// fn main() [io]
+//     println(exifvalue.ascii_text(ExifAscii(bytes.from_str("Canon\u{0}"))))   // Canon
+// ```
+pub fn ascii_text(v: ExifValue) -> Str []
+    todo("exif-nv.exifvalue.ascii_text")
+
+// An ASCII value from text, with the trailing NUL added.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println("${exifvalue.count_of(exifvalue.ascii_value("Canon"))}")   // 6, the NUL included
+// ```
+pub fn ascii_value(text: Str) -> ExifValue []
+    todo("exif-nv.exifvalue.ascii_value")
+
+// The first element of an integer-valued entry, or `None`.
+//
+// The accessor for the tags whose count is one — `Orientation`,
+// `ResolutionUnit`, `ISOSpeedRatings` — spelled so that "the first of
+// the list" is said rather than assumed.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     match exifvalue.first_int(ExifShorts([6]))
+//         Some(n) => println("${n}")            // 6
+//         None    => println("not an integer value")
+// ```
+pub fn first_int(v: ExifValue) -> ?Int []
+    todo("exif-nv.exifvalue.first_int")
+
+// The first element of a rational-valued entry, or `None`.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     match exifvalue.first_ratio(ExifRationals([ExifRational { numerator: 1, denominator: 250 }]))
+//         Some(r) => println(exifvalue.format_ratio(r))   // 1/250
+//         None    => println("not a rational value")
+// ```
+pub fn first_ratio(v: ExifValue) -> ?ExifRational []
+    todo("exif-nv.exifvalue.first_ratio")
+
+// How many bytes this value occupies in the file: `count * type_size`.
+//
+// The number that decides whether the value fits the four bytes a
+// directory entry has for it or has to be written elsewhere and
+// pointed at — which is the whole of why a rewrite moves things.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println("${exifvalue.byte_length(ExifShorts([72, 72]))}")   // 4, so it fits inline
+// ```
+pub fn byte_length(v: ExifValue) -> Int []
+    todo("exif-nv.exifvalue.byte_length")
+
+// Whether a value fits the four bytes a directory entry holds inline.
+//
+// ```novo
+// use exifvalue
+//
+// fn main() [io]
+//     println("${exifvalue.fits_inline(ExifShorts([72, 72]))}")   // true
+//     println("${exifvalue.fits_inline(ExifRationals([]))}")      // true — nothing fits
+// ```
+pub fn fits_inline(v: ExifValue) -> Bool []
+    todo("exif-nv.exifvalue.fits_inline")

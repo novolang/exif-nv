@@ -1,0 +1,135 @@
+// exiforient_tests.nv — the eight orientations of tag 0x0112, against
+// EXIF 2.32 section 4.6.4.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: exif-nv.exiforient.<fn>`.
+//
+// THE FOUR THAT MIRROR are what this suite is mostly about.  Most
+// implementations handle 1, 3, 6 and 8 and silently mishandle 2, 4, 5
+// and 7, which scanners and some phone front cameras write.
+
+use std.test
+use exiforient
+
+@test
+fn test_the_eight_values_and_their_numbers() [io]
+    test.case("1 to 8, in the specification's order")
+    test.assert(exiforient.tag_value(ExifUpright) == 1)
+    test.assert(exiforient.tag_value(ExifMirrorH) == 2)
+    test.assert(exiforient.tag_value(ExifRotate180) == 3)
+    test.assert(exiforient.tag_value(ExifMirrorV) == 4)
+    test.assert(exiforient.tag_value(ExifMirrorHRotate90) == 5)
+    test.assert(exiforient.tag_value(ExifRotate90) == 6)
+    test.assert(exiforient.tag_value(ExifMirrorHRotate270) == 7)
+    test.assert(exiforient.tag_value(ExifRotate270) == 8)
+
+    test.case("the names are image-io-nv's, so the two read the same way")
+    test.assert(exiforient.orientation_name(ExifUpright) == "upright")
+    test.assert(exiforient.orientation_name(ExifMirrorH) == "mirror-h")
+    test.assert(exiforient.orientation_name(ExifRotate180) == "rotate-180")
+    test.assert(exiforient.orientation_name(ExifMirrorV) == "mirror-v")
+    test.assert(exiforient.orientation_name(ExifRotate90) == "rotate-90")
+    test.assert(exiforient.orientation_name(ExifRotate270) == "rotate-270")
+
+@test
+fn test_a_nonsense_value_is_upright_and_not_a_refusal() [io]
+    // A broken orientation tag is not a reason to fail to open a
+    // photograph, and treating it as upright is what every viewer
+    // does.  image-io-nv made the same judgement.
+    test.case("every value in range round trips")
+    test.assert(exiforient.tag_value(exiforient.from_tag_value(6)) == 6)
+    test.assert(exiforient.tag_value(exiforient.from_tag_value(1)) == 1)
+    test.assert(exiforient.tag_value(exiforient.from_tag_value(8)) == 8)
+
+    test.case("and everything else is upright")
+    test.assert(exiforient.orientation_name(exiforient.from_tag_value(0)) == "upright")
+    test.assert(exiforient.orientation_name(exiforient.from_tag_value(9)) == "upright")
+    test.assert(exiforient.orientation_name(
+        exiforient.from_tag_value(0 - 3)) == "upright")
+
+@test
+fn test_four_of_the_eight_exchange_width_and_height() [io]
+    // A 4000-by-3000 file with ExifRotate90 is a 3000-by-4000
+    // picture, and a thumbnail service that sized its output from the
+    // file's own dimensions gets every portrait photograph wrong.
+    test.case("the quarter turns do")
+    test.assert(exiforient.swaps_dimensions(ExifMirrorHRotate90))
+    test.assert(exiforient.swaps_dimensions(ExifRotate90))
+    test.assert(exiforient.swaps_dimensions(ExifMirrorHRotate270))
+    test.assert(exiforient.swaps_dimensions(ExifRotate270))
+
+    test.case("and the half turns and the mirrors do not")
+    test.assert(not exiforient.swaps_dimensions(ExifUpright))
+    test.assert(not exiforient.swaps_dimensions(ExifMirrorH))
+    test.assert(not exiforient.swaps_dimensions(ExifRotate180))
+    test.assert(not exiforient.swaps_dimensions(ExifMirrorV))
+
+@test
+fn test_four_of_the_eight_mirror_and_they_are_the_forgotten_half() [io]
+    test.case("2, 4, 5 and 7 mirror")
+    test.assert(exiforient.mirrors(ExifMirrorH))
+    test.assert(exiforient.mirrors(ExifMirrorV))
+    test.assert(exiforient.mirrors(ExifMirrorHRotate90))
+    test.assert(exiforient.mirrors(ExifMirrorHRotate270))
+
+    test.case("1, 3, 6 and 8 do not")
+    test.assert(not exiforient.mirrors(ExifUpright))
+    test.assert(not exiforient.mirrors(ExifRotate180))
+    test.assert(not exiforient.mirrors(ExifRotate90))
+    test.assert(not exiforient.mirrors(ExifRotate270))
+
+@test
+fn test_the_rotation_is_stated_in_degrees_clockwise() [io]
+    test.case("the four pure rotations")
+    test.assert(exiforient.rotation_degrees(ExifUpright) == 0)
+    test.assert(exiforient.rotation_degrees(ExifRotate90) == 90)
+    test.assert(exiforient.rotation_degrees(ExifRotate180) == 180)
+    test.assert(exiforient.rotation_degrees(ExifRotate270) == 270)
+
+    test.case("a mirror on its own is no rotation")
+    test.assert(exiforient.rotation_degrees(ExifMirrorH) == 0)
+    test.assert(exiforient.rotation_degrees(ExifMirrorV) == 180)
+
+    test.case("and the mirrored quarter turns carry theirs")
+    test.assert(exiforient.rotation_degrees(ExifMirrorHRotate90) == 90)
+    test.assert(exiforient.rotation_degrees(ExifMirrorHRotate270) == 270)
+
+@test
+fn test_a_tool_that_rotates_the_pixels_must_clear_the_tag() [io]
+    // A tool that applies the transform and leaves the tag shows the
+    // picture sideways the other way in the next program that opens
+    // it.  Both failures are everywhere.
+    test.case("after applying, every orientation is upright")
+    test.assert(exiforient.orientation_name(
+        exiforient.after_applying(ExifRotate90)) == "upright")
+    test.assert(exiforient.orientation_name(
+        exiforient.after_applying(ExifMirrorHRotate270)) == "upright")
+    test.assert(exiforient.orientation_name(
+        exiforient.after_applying(ExifUpright)) == "upright")
+
+@test
+fn test_composing_two_orientations_is_the_group_operation() [io]
+    // For a tool that rotates a picture that already had a tag.
+    // Computing it by hand through the mirroring cases is where the
+    // errors are.
+    test.case("two quarter turns are a half turn")
+    test.assert(exiforient.orientation_name(
+        exiforient.compose(ExifRotate90, ExifRotate90)) == "rotate-180")
+
+    test.case("four quarter turns are nothing")
+    let half = exiforient.compose(ExifRotate90, ExifRotate90)
+    test.assert(exiforient.orientation_name(
+        exiforient.compose(half, half)) == "upright")
+
+    test.case("upright is the identity on either side")
+    test.assert(exiforient.orientation_name(
+        exiforient.compose(ExifUpright, ExifMirrorV)) == "mirror-v")
+    test.assert(exiforient.orientation_name(
+        exiforient.compose(ExifMirrorV, ExifUpright)) == "mirror-v")
+
+    test.case("two mirrors in the same axis cancel")
+    test.assert(exiforient.orientation_name(
+        exiforient.compose(ExifMirrorH, ExifMirrorH)) == "upright")
+
+    test.case("and a mirror composed with a quarter turn is a mirrored one")
+    test.assert(exiforient.mirrors(exiforient.compose(ExifMirrorH, ExifRotate90)))

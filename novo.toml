@@ -1,0 +1,42 @@
+[package]
+name        = "exif-nv"
+version     = "0.0.1"
+description = "EXIF 2.32 metadata as TIFF structure over bytes the caller holds: the five image file directories with their entries typed, RATIONAL and SRATIONAL kept as the two integers the file stores rather than collapsed to a float, orientation as one of eight named transforms, the thumbnail as a span into the caller's buffer, and the same metadata written back into a JPEG APP1 segment, a PNG eXIf chunk or a bare TIFF.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  EXIF is a TIFF structure inside a container, and both are
+# byte arithmetic: an offset, a byte order, a type code and a count.
+# The bytes arrive as arguments and the edited bytes leave as a value,
+# so a caller reading from a file, a socket or a memory map spends its
+# own effect once and this package spends none.
+layer       = "core"
+
+category    = "graphics"
+
+tags        = ["exif", "tiff", "metadata", "jpeg", "png", "orientation", "gps", "thumbnail", "exif-2.32", "sans-io"]
+repository  = "https://github.com/novolang/exif-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "EXIF 2.32 read from JPEG, PNG and TIFF, and written back"
+
+# NO DEPENDENCIES, and that is a decision rather than an accident.
+# EXIF is a TIFF header, a chain of directories and a table of tag
+# numbers.  Reading it needs no image codec, no colour space and no
+# date library: a DateTime tag is six numbers in a fixed-width ASCII
+# field, and handing back the field rather than a parsed instant is
+# what keeps this package from imposing a calendar on its callers.
+# tz-nv and chrono-nv are the packages that turn the field into a
+# time, and a caller that wants one calls them.
+[dependencies]

@@ -1,0 +1,149 @@
+// exiffault.nv — every way EXIF metadata can fail to be read or
+// written, with the offset that says where.
+//
+// A REFUSAL IS ABOUT A DIRECTORY ENTRY, SO IT NAMES ONE
+//
+// EXIF is a chain of directories, each a count followed by that many
+// twelve-byte entries, each entry a tag number, a type code, a count
+// and either a value or an offset to one.  Almost everything that goes
+// wrong goes wrong at one entry, and the entry can be named: the
+// directory it was in, the tag number it carried, and the byte offset
+// it sat at.  A message that says only "malformed EXIF" leaves a
+// caller with a photograph and no idea which of its forty tags is the
+// problem.
+//
+// MOST DEFECTS ARE NOT FATAL, AND THAT IS THE POINT
+//
+// Real files have tags whose declared type does not match the tag
+// table, counts that run past the end of the segment, and offsets that
+// point outside it.  A reader that refused the file would refuse a
+// large share of the photographs in the world, and the metadata a
+// caller wanted is usually in a different entry.  So the reader
+// collects these as FINDINGS and keeps going, and only the refusals
+// that make the structure unreadable at all stop it.  `is_fatal` is
+// the predicate that separates the two, and `exifread.read_report` is
+// the function that hands back both.
+
+// Why EXIF could not be read or written.
+//
+// ```novo
+// use exiffault
+//
+// fn main() [io]
+//     println(ExifNoExif.message())
+// ```
+pub enum ExifFault
+    // The container carries no EXIF at all: a JPEG with no APP1
+    // segment bearing the `Exif\0\0` identifier, a PNG with no `eXIf`
+    // chunk.  NOT an error in most programs — a photograph without
+    // metadata is an ordinary photograph — which is why the reading
+    // functions answer `?ExifData` and this arm exists for the callers
+    // that required it.
+    ExifNoExif
+    // The bytes are not a container this package knows.
+    ExifUnknownContainer
+    // The TIFF header's byte-order mark is neither `II` nor `MM`.
+    ExifBadByteOrder(offset: Int, found: Int)
+    // The TIFF header's magic number is not 42.
+    ExifBadMagic(offset: Int, found: Int)
+    // A directory's entry count runs past the end of the data.
+    ExifDirectoryTruncated(offset: Int, entries: Int, available: Int)
+    // An entry's value offset points outside the EXIF data.
+    ExifOffsetOutOfRange(offset: Int, tag: Int, pointed_at: Int, limit: Int)
+    // An entry's type code is not one of the twelve TIFF 6.0 defines.
+    ExifUnknownType(offset: Int, tag: Int, type_code: Int)
+    // An entry's type is not the one the tag table says the tag has.
+    // A finding, not a refusal: the value is still readable and a
+    // caller that wants it can have it.
+    ExifTypeMismatch(offset: Int, tag: Int, declared: Int, expected: Int)
+    // An entry's count is not the one the tag table says the tag has.
+    // A finding.
+    ExifCountMismatch(offset: Int, tag: Int, declared: Int, expected: Int)
+    // A RATIONAL or SRATIONAL whose denominator is zero.  Reported
+    // rather than answered as infinity, because the exposure time a
+    // caller is about to print is not a number.
+    ExifZeroDenominator(offset: Int, tag: Int)
+    // The directory chain loops: a next-directory offset that points
+    // at a directory already visited.  A refusal, because the
+    // alternative is a reader that does not terminate.
+    ExifDirectoryLoop(offset: Int)
+    // More directories than this reader will follow.  Also a bound
+    // against a crafted file rather than a statement about a real one.
+    ExifTooManyDirectories(limit: Int)
+    // A caller asked to write a value whose type does not match the
+    // tag table's.
+    ExifWrongTypeForTag(tag: Int, given: Int, expected: Int)
+    // A caller asked to write a JPEG APP1 segment larger than the
+    // 65533 bytes a JPEG marker segment's two-byte length allows.
+    // The hard ceiling on how much metadata a JPEG can carry, and the
+    // reason a large thumbnail cannot be written into one.
+    ExifSegmentTooLarge(bytes_needed: Int, limit: Int)
+    // A caller asked to write EXIF into a container that has no place
+    // to put it.
+    ExifContainerCannotCarry
+
+// `ExifFault` is an `Error`, which is what lets `Result<T, ExifFault>`
+// exist at all.
+impl Error for ExifFault
+    // The one-line message, naming the tag and the offset.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("exif-nv.ExifFault.message")
+
+// The byte offset the refusal is about, or `-1` when it is about the
+// whole file or a caller's argument.
+//
+// ```novo
+// use exiffault
+//
+// fn main() [io]
+//     println("${exiffault.offset_of(ExifBadMagic(2, 41))}")   // 2
+//     println("${exiffault.offset_of(ExifNoExif)}")            // -1
+// ```
+pub fn offset_of(f: ExifFault) -> Int []
+    todo("exif-nv.exiffault.offset_of")
+
+// The tag number the refusal is about, or `-1`.
+//
+// ```novo
+// use exiffault
+//
+// fn main() [io]
+//     println("${exiffault.tag_of(ExifZeroDenominator(120, 0x829A))}")   // 33434
+// ```
+pub fn tag_of(f: ExifFault) -> Int []
+    todo("exif-nv.exiffault.tag_of")
+
+// A short stable code for logs and metrics: `"no_exif"`,
+// `"bad_magic"`, `"type_mismatch"`, and so on.
+//
+// ```novo
+// use exiffault
+//
+// fn main() [io]
+//     println(exiffault.code(ExifNoExif))       // no_exif
+// ```
+pub fn code(f: ExifFault) -> Str []
+    todo("exif-nv.exiffault.code")
+
+// Whether this refusal makes the structure unreadable, as opposed to
+// spoiling one entry.
+//
+// THE PREDICATE THAT DECIDES WHETHER A PHOTOGRAPH IS READ AT ALL.
+// Real files carry entries whose type disagrees with the tag table and
+// counts that disagree with it, and a reader that refused them would
+// refuse a large share of the photographs in the world for a tag the
+// caller did not ask for.  False for the four mismatches and the zero
+// denominator; true for a broken header, a truncated directory and a
+// loop.
+//
+// ```novo
+// use exiffault
+//
+// fn main() [io]
+//     println("${exiffault.is_fatal(ExifBadMagic(2, 41))}")                   // true
+//     println("${exiffault.is_fatal(ExifTypeMismatch(120, 0x010F, 3, 2))}")   // false
+// ```
+pub fn is_fatal(f: ExifFault) -> Bool []
+    todo("exif-nv.exiffault.is_fatal")

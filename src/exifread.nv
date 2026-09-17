@@ -1,0 +1,292 @@
+// exifread.nv — finding the EXIF block in a container, and reading it.
+//
+// THE CALLER NAMES THE CONTAINER, OR ASKS THIS TO SNIFF
+//
+// EXIF travels inside three containers and the block is in a different
+// place in each: a JPEG APP1 marker segment whose payload begins
+// `Exif\0\0`, a PNG `eXIf` chunk, or the file itself when the file is
+// a TIFF.  A caller that knows what it has calls `read_jpeg`,
+// `read_png` or `read_tiff` and gets a refusal if it was wrong.  A
+// caller that does not calls `read`, which sniffs the first bytes.
+//
+// BOTH SPELLINGS EXIST BECAUSE SNIFFING IS A GUESS.  A tool processing
+// a directory of files sniffs; a JPEG pipeline that has already
+// decoded the JPEG header does not, and it should not be made to pay
+// for a second guess or to accept a PNG by accident.
+//
+// EVERY OFFSET IS RELATIVE TO THE TIFF HEADER
+//
+// This is the fact that produces the most wrong EXIF code.  The
+// offsets inside the structure are counted from the start of the TIFF
+// header — the `II` or `MM` — and NOT from the start of the file, not
+// from the start of the APP1 segment, and not from the start of the
+// `Exif\0\0` identifier.  So reading EXIF out of a JPEG means finding
+// the segment, stepping over six bytes, and then treating what follows
+// as its own little address space.
+//
+// `ExifData.tiff_span` carries where that address space began, so a
+// caller holding a span into the file can convert either way without
+// re-deriving it.
+//
+// A BOUNDED READ
+//
+// A crafted file can point a directory at itself, chain a thousand
+// directories, or declare a count of four thousand million.  The
+// options carry the three ceilings that stop each, and their defaults
+// are well above anything a camera writes.
+
+use exifdata
+
+// Which container the EXIF is in.
+//
+// ```novo
+// use exifread
+//
+// fn main() [io]
+//     println(exifread.container_name(ExifContainerJpeg))   // jpeg
+// ```
+pub enum ExifContainer
+    // A JPEG: an APP1 marker segment whose payload begins
+    // `Exif\0\0`.
+    ExifContainerJpeg
+    // A PNG: an `eXIf` chunk, which the PNG third edition added in
+    // 2017 and which carries the TIFF structure with no identifier
+    // prefix.
+    ExifContainerPng
+    // A TIFF: the file IS the TIFF structure, starting at byte zero.
+    ExifContainerTiff
+
+// How far a read will go before it refuses.
+pub struct ExifReadOptions
+    // How many directories to follow.  A crafted file can chain
+    // thousands; a camera writes at most five.
+    max_directories: Int
+    // How many entries to read from one directory.  The count field
+    // is two bytes, so the format's own ceiling is 65535.
+    max_entries: Int
+    // How many bytes of value data to read in total.  A count field
+    // is four bytes, so one entry can claim four thousand million.
+    max_value_bytes: Int
+
+// The ordinary ceilings: 16 directories, 65535 entries each, 16
+// megabytes of value data.
+//
+// Well above anything a camera writes, and well below anything that
+// costs a server.
+//
+// ```novo
+// use exifread
+//
+// fn main() [io]
+//     println("${exifread.default_options().max_directories}")   // 16
+// ```
+pub fn default_options() -> ExifReadOptions []
+    todo("exif-nv.exifread.default_options")
+
+// The same options with a different directory ceiling.
+//
+// ```novo
+// use exifread
+//
+// fn main() [io]
+//     println("${exifread.with_max_directories(exifread.default_options(), 4).max_directories}")
+// ```
+pub fn with_max_directories(o: ExifReadOptions, n: Int) -> ExifReadOptions []
+    todo("exif-nv.exifread.with_max_directories")
+
+// The same options with a different ceiling on value bytes.
+//
+// ```novo
+// use exifread
+//
+// fn main() [io]
+//     println("${exifread.with_max_value_bytes(exifread.default_options(), 1024).max_value_bytes}")
+// ```
+pub fn with_max_value_bytes(o: ExifReadOptions, n: Int) -> ExifReadOptions []
+    todo("exif-nv.exifread.with_max_value_bytes")
+
+// The container's name: `"jpeg"`, `"png"`, `"tiff"`.
+//
+// ```novo
+// use exifread
+//
+// fn main() [io]
+//     println(exifread.container_name(ExifContainerTiff))   // tiff
+// ```
+pub fn container_name(c: ExifContainer) -> Str []
+    todo("exif-nv.exifread.container_name")
+
+// The container these bytes are, or `None`.
+//
+// Reads the magic number and nothing else: `FF D8` for JPEG, the
+// eight-byte PNG signature, `II 2A 00` or `MM 00 2A` for TIFF.  It does
+// NOT say whether there is any EXIF inside — that costs a walk — and
+// answering the two questions separately is what lets a caller skip
+// files it does not handle before it reads any further.
+//
+// ```novo
+// use std.bytes
+// use exifread
+//
+// fn main() [io]
+//     match exifread.sniff_container(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xE1]))
+//         Some(c) => println(exifread.container_name(c))   // jpeg
+//         None    => println("not a container this package reads")
+// ```
+pub fn sniff_container(source: Bytes) -> ?ExifContainer []
+    todo("exif-nv.exifread.sniff_container")
+
+// The EXIF in these bytes, whatever the container, or `None` when
+// there is none.
+//
+// `None` rather than a refusal, because a photograph with no metadata
+// is an ordinary photograph.  `ExifUnknownContainer` is what a caller
+// gets for bytes that are not a JPEG, a PNG or a TIFF at all.
+//
+// ```novo
+// use std.bytes
+// use exifread
+//
+// fn main() [io]
+//     match exifread.read(bytes.zeros(64), exifread.default_options())
+//         Err(e) => println(e.message())
+//         Ok(d)  =>
+//             match d
+//                 Some(_) => println("metadata present")
+//                 None    => println("no metadata")
+// ```
+pub fn read(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
+    todo("exif-nv.exifread.read")
+
+// The EXIF, and every non-fatal finding about it.
+//
+// WHAT A VALIDATOR CALLS.  `read` answers the data and discards the
+// findings, because a viewer does not care that `ResolutionUnit` was
+// written as a LONG where the specification says SHORT.  A tool that
+// checks files before publishing them does, and this is how it asks.
+//
+// ```novo
+// use std.bytes
+// use exifdata
+// use exifread
+//
+// fn main() [io]
+//     match exifread.read_report(bytes.zeros(64), exifread.default_options())
+//         Err(e) => println(e.message())
+//         Ok(r)  =>
+//             match r
+//                 Some(rep) => println("${exifdata.finding_count(rep)} finding(s)")
+//                 None      => println("no metadata")
+// ```
+pub fn read_report(source: Bytes, o: ExifReadOptions) -> Result<?ExifReport, ExifFault> []
+    todo("exif-nv.exifread.read_report")
+
+// The EXIF in a JPEG's APP1 segment, or `None`.
+//
+// Refuses `ExifUnknownContainer` for bytes that are not a JPEG, which
+// is the difference from `read`: a caller that knows what it has wants
+// to be told when it was wrong.
+//
+// ```novo
+// use std.bytes
+// use exifread
+//
+// fn main() [io]
+//     match exifread.read_jpeg(bytes.from_byte_list([0x89, 0x50, 0x4E, 0x47]),
+//                              exifread.default_options())
+//         Ok(_)  => println("this cannot happen — that is a PNG")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_jpeg(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
+    todo("exif-nv.exifread.read_jpeg")
+
+// The EXIF in a PNG's `eXIf` chunk, or `None`.
+//
+// The chunk carries the TIFF structure with NO `Exif\0\0` prefix,
+// unlike the JPEG segment — a difference that is one line in the
+// specification and two hours in a debugger.
+//
+// ```novo
+// use std.bytes
+// use exifread
+//
+// fn main() [io]
+//     match exifread.read_png(bytes.zeros(32), exifread.default_options())
+//         Ok(_)  => println("read, or no eXIf chunk")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_png(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
+    todo("exif-nv.exifread.read_png")
+
+// The EXIF in a bare TIFF: the file itself.
+//
+// ```novo
+// use std.bytes
+// use exifread
+//
+// fn main() [io]
+//     match exifread.read_tiff(bytes.from_byte_list([0x49, 0x49, 0x2A, 0x00]),
+//                              exifread.default_options())
+//         Ok(_)  => println("read")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_tiff(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
+    todo("exif-nv.exifread.read_tiff")
+
+// Where the TIFF structure begins inside a container, or `None`.
+//
+// The offset every offset inside the structure is counted from: past
+// the APP1 marker and the six bytes of `Exif\0\0` in a JPEG, past the
+// chunk header in a PNG, and zero in a TIFF.  Public because a caller
+// holding a span into its own buffer — a thumbnail, a MakerNote —
+// needs to convert between the two address spaces, and because it is
+// the fact that produces the most wrong EXIF code.
+//
+// ```novo
+// use std.bytes
+// use exifread
+//
+// fn main() [io]
+//     match exifread.tiff_offset(bytes.zeros(64))
+//         Some(n) => println("${n}")
+//         None    => println("no EXIF here")
+// ```
+pub fn tiff_offset(source: Bytes) -> ?Int []
+    todo("exif-nv.exifread.tiff_offset")
+
+// Only the orientation, without reading the rest.
+//
+// THE QUERY THAT PAYS FOR ITSELF.  A thumbnail service reads one tag
+// out of every photograph and nothing else, and walking five
+// directories and allocating forty values to find it is most of the
+// cost of the read.  This follows the 0th IFD only and stops at tag
+// 0x0112.
+//
+// `ExifUpright` when the file carries no orientation, which is what
+// every viewer assumes.
+//
+// ```novo
+// use std.bytes
+// use exiforient
+// use exifread
+//
+// fn main() [io]
+//     println(exiforient.orientation_name(exifread.read_orientation(bytes.zeros(64))))
+// ```
+pub fn read_orientation(source: Bytes) -> ExifOrientation []
+    todo("exif-nv.exifread.read_orientation")
+
+// Whether these bytes carry any EXIF at all.
+//
+// Finds the block and does not walk it, so it costs the container scan
+// and no allocation.
+//
+// ```novo
+// use std.bytes
+// use exifread
+//
+// fn main() [io]
+//     println("${exifread.has_exif(bytes.zeros(64))}")   // false
+// ```
+pub fn has_exif(source: Bytes) -> Bool []
+    todo("exif-nv.exifread.has_exif")

@@ -1,0 +1,366 @@
+// exifcodec_tests.nv — reading EXIF out of the three containers and
+// writing it back, against EXIF 2.32 sections 4.5 and 4.7, TIFF 6.0
+// section 2, and the PNG third edition's `eXIf` chunk.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: exif-nv.<module>.<fn>`.
+
+use std.test
+use std.list
+use std.bytes
+use exiffault
+use exiftag
+use exifvalue
+use exiforient
+use exifdata
+use exifread
+use exifwrite
+
+// The eight bytes of a little-endian TIFF header whose 0th IFD starts
+// at offset 8: `II`, 42, then the offset.
+fn tiff_header() -> Bytes
+    bytes.from_byte_list([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00])
+
+@test
+fn test_the_three_containers_are_sniffed_by_their_magic_and_nothing_more() [io]
+    test.case("a JPEG starts FF D8")
+    match exifread.sniff_container(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xE1]))
+        Some(c) => test.assert(exifread.container_name(c) == "jpeg")
+        None    => test.fail("that is a JPEG")
+
+    test.case("a PNG has its eight-byte signature")
+    match exifread.sniff_container(bytes.from_byte_list([0x89, 0x50, 0x4E, 0x47,
+                                                         0x0D, 0x0A, 0x1A, 0x0A]))
+        Some(c) => test.assert(exifread.container_name(c) == "png")
+        None    => test.fail("that is a PNG")
+
+    test.case("a TIFF is its own header, in either byte order")
+    match exifread.sniff_container(tiff_header())
+        Some(c) => test.assert(exifread.container_name(c) == "tiff")
+        None    => test.fail("that is a TIFF")
+    match exifread.sniff_container(bytes.from_byte_list([0x4D, 0x4D, 0x00, 0x2A]))
+        Some(c) => test.assert(exifread.container_name(c) == "tiff")
+        None    => test.fail("that is a big-endian TIFF")
+
+    test.case("and anything else is not a container this package reads")
+    match exifread.sniff_container(bytes.from_byte_list([0x47, 0x49, 0x46, 0x38]))
+        Some(_) => test.fail("a GIF carries no EXIF")
+        None    => test.assert(true)
+
+    test.case("sniffing does NOT say whether there is EXIF inside")
+    // Two questions, answered separately, so a caller can skip files
+    // it does not handle before it reads any further.
+    test.assert(not exifread.has_exif(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDB])))
+
+@test
+fn test_the_read_options_bound_a_crafted_file() [io]
+    let o = exifread.default_options()
+
+    test.case("the defaults are above anything a camera writes")
+    test.assert(o.max_directories == 16)
+    test.assert(o.max_entries == 65535)
+    test.assert(o.max_value_bytes > 0)
+
+    test.case("and each ceiling is set on its own")
+    test.assert(exifread.with_max_directories(o, 4).max_directories == 4)
+    test.assert(exifread.with_max_value_bytes(o, 1024).max_value_bytes == 1024)
+
+@test
+fn test_no_metadata_is_an_answer_and_not_a_refusal() [io]
+    // A photograph with no metadata is an ordinary photograph.
+    test.case("a JPEG with no APP1 answers None")
+    match exifread.read(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43]),
+                        exifread.default_options())
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            match d
+                Some(_) => test.fail("there is no APP1 segment")
+                None    => test.assert(true)
+
+    test.case("but bytes that are no container at all are refused")
+    match exifread.read(bytes.from_byte_list([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]),
+                        exifread.default_options())
+        Ok(_)  => test.fail("a GIF is not a container this package reads")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+
+    test.case("and a named container refuses bytes that are not it")
+    match exifread.read_jpeg(bytes.from_byte_list([0x89, 0x50, 0x4E, 0x47]),
+                             exifread.default_options())
+        Ok(_)  => test.fail("that is a PNG")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+    match exifread.read_png(tiff_header(), exifread.default_options())
+        Ok(_)  => test.fail("that is a TIFF")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+
+@test
+fn test_a_broken_header_is_fatal_and_a_broken_entry_is_not() [io]
+    // Real files carry entries whose type disagrees with the table.  A
+    // reader that refused them would refuse a large share of the
+    // photographs in the world for a tag the caller did not ask for.
+    test.case("a bad magic number stops the read")
+    match exifread.read_tiff(bytes.from_byte_list([0x49, 0x49, 0x29, 0x00,
+                                                    0x08, 0x00, 0x00, 0x00]),
+                             exifread.default_options())
+        Ok(_)  => test.fail("the magic number is 42, not 41")
+        Err(e) =>
+            test.assert(exiffault.code(e) == "bad_magic")
+            test.assert(exiffault.is_fatal(e))
+
+    test.case("a bad byte-order mark stops it too")
+    match exifread.read_tiff(bytes.from_byte_list([0x4D, 0x49, 0x2A, 0x00,
+                                                    0x08, 0x00, 0x00, 0x00]),
+                             exifread.default_options())
+        Ok(_)  => test.fail("MI is not a byte order")
+        Err(e) => test.assert(exiffault.is_fatal(e))
+
+    test.case("but a type mismatch is a finding")
+    test.assert(not exiffault.is_fatal(ExifTypeMismatch(120, 0x0128, 4, 3)))
+    test.assert(not exiffault.is_fatal(ExifCountMismatch(120, 0x0112, 2, 1)))
+    test.assert(not exiffault.is_fatal(ExifZeroDenominator(160, 0x829A)))
+
+    test.case("a directory loop is fatal, because the alternative does not terminate")
+    test.assert(exiffault.is_fatal(ExifDirectoryLoop(8)))
+
+    test.case("and a refusal names the tag and the offset it was about")
+    test.assert(exiffault.tag_of(ExifZeroDenominator(160, 0x829A)) == 0x829A)
+    test.assert(exiffault.offset_of(ExifZeroDenominator(160, 0x829A)) == 160)
+    test.assert(exiffault.offset_of(ExifNoExif) == 0 - 1)
+    test.assert(exiffault.code(ExifNoExif) == "no_exif")
+
+@test
+fn test_the_report_carries_the_findings_beside_the_data() [io]
+    // A viewer ignores them and a validator prints them, and neither
+    // has to choose between reading the file and knowing what was
+    // wrong with it.
+    test.case("a report with nothing wrong carries no findings")
+    let clean = ExifReport { data: exifdata.empty(ExifLittleEndian), findings: [] }
+    test.assert(exifdata.finding_count(clean) == 0)
+
+    test.case("read_report answers a report where read answers data")
+    match exifread.read_report(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDB]),
+                               exifread.default_options())
+        Err(e) => test.fail(e.message())
+        Ok(r)  =>
+            match r
+                Some(_) => test.fail("there is no APP1 segment")
+                None    => test.assert(true)
+
+@test
+fn test_every_offset_is_relative_to_the_tiff_header() [io]
+    // The fact that produces the most wrong EXIF code: the offsets are
+    // counted from the `II` or `MM`, not from the start of the file
+    // and not from the start of `Exif\0\0`.
+    test.case("a bare TIFF's structure starts at zero")
+    match exifread.tiff_offset(tiff_header())
+        Some(n) => test.assert(n == 0)
+        None    => test.fail("a TIFF is its own EXIF")
+
+    test.case("and a file with no EXIF has no such offset")
+    match exifread.tiff_offset(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDB]))
+        Some(_) => test.fail("there is no APP1 segment")
+        None    => test.assert(true)
+
+    test.case("the data carries where that address space began")
+    test.assert(exifdata.empty(ExifLittleEndian).tiff_span.start >= 0)
+
+@test
+fn test_reading_only_the_orientation_costs_one_directory() [io]
+    // A thumbnail service reads one tag out of every photograph and
+    // nothing else, and walking five directories to find it is most of
+    // the cost of the read.
+    test.case("a file with no EXIF is upright")
+    test.assert(exiforient.orientation_name(
+        exifread.read_orientation(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDB])))
+        == "upright")
+
+    test.case("and so is a file with EXIF and no orientation tag")
+    test.assert(exiforient.orientation_name(
+        exifread.read_orientation(tiff_header())) == "upright")
+
+@test
+fn test_the_data_accessors_read_what_is_there_and_say_when_nothing_is() [io]
+    let empty = exifdata.empty(ExifLittleEndian)
+
+    test.case("empty metadata has no entries and no directories")
+    test.assert(exifdata.entry_count(empty) == 0)
+    test.assert(list.len(exifdata.entries_in(empty, ExifIfdPrimary)) == 0)
+    test.assert(not exifdata.has_ifd(empty, ExifIfdGps))
+    test.assert(exifvalue.byte_order_mark(empty.byte_order) == "II")
+
+    test.case("setting an entry adds it, and setting it again replaces it")
+    let one = exifdata.set(empty, ExifIfdPrimary, 0x0112, ExifShorts([6]))
+    test.assert(exifdata.entry_count(one) == 1)
+    test.assert(exifdata.entry_count(
+        exifdata.set(one, ExifIfdPrimary, 0x0112, ExifShorts([1]))) == 1)
+
+    test.case("and the same tag in a different directory is a different entry")
+    test.assert(exifdata.entry_count(
+        exifdata.set(one, ExifIfdExif, 0x0112, ExifShorts([1]))) == 2)
+
+    test.case("removing takes it away again")
+    test.assert(exifdata.entry_count(
+        exifdata.remove(one, ExifIfdPrimary, 0x0112)) == 0)
+
+    test.case("an entry reads back with the directory it is in")
+    match exifdata.entry(one, ExifIfdPrimary, 0x0112)
+        Some(e) =>
+            test.assert(e.tag == 0x0112)
+            test.assert(exiftag.ifd_name(e.ifd) == "0th")
+        None    => test.fail("it was just set")
+
+    test.case("and a value reads back through the shorter accessor")
+    match exifdata.value(one, ExifIfdPrimary, 0x0112)
+        Some(v) => test.assert(exifvalue.first_int(v) == Some(6))
+        None    => test.fail("it was just set")
+
+@test
+fn test_orientation_is_upright_when_absent_and_told_apart_when_asked() [io]
+    // A file with no orientation tag is upright, which is what every
+    // viewer assumes.  Making every caller write the `??` would be
+    // making every caller write the same `??`.
+    let empty = exifdata.empty(ExifLittleEndian)
+
+    test.case("absent reads as upright")
+    test.assert(exiforient.orientation_name(exifdata.orientation(empty)) == "upright")
+
+    test.case("but has_orientation tells absent from a tag that says 1")
+    test.assert(not exifdata.has_orientation(empty))
+    test.assert(exifdata.has_orientation(
+        exifdata.with_orientation(empty, ExifUpright)))
+
+    test.case("and a set orientation reads back")
+    test.assert(exiforient.orientation_name(
+        exifdata.orientation(exifdata.with_orientation(empty, ExifRotate90)))
+        == "rotate-90")
+
+@test
+fn test_the_thumbnail_and_the_maker_note_are_spans_and_not_copies() [io]
+    // A thumbnail is typically 10 to 40 kilobytes and the
+    // overwhelming majority of callers wanted the exposure time.
+    let empty = exifdata.empty(ExifLittleEndian)
+
+    test.case("a span is a start and a length")
+    let s = ExifSpan { start: 1024, length: 8192 }
+    test.assert(s.start == 1024)
+    test.assert(s.length == 8192)
+
+    test.case("no thumbnail is None, not an empty span")
+    match exifdata.thumbnail_span(empty)
+        Some(_) => test.fail("there is none")
+        None    => test.assert(true)
+    match exifdata.maker_note_span(empty)
+        Some(_) => test.fail("there is none")
+        None    => test.assert(true)
+
+    test.case("copying the bytes out is the caller's one line")
+    match exifdata.thumbnail_bytes(empty, bytes.zeros(64))
+        Some(_) => test.fail("there is no thumbnail")
+        None    => test.assert(true)
+
+    test.case("and the compression tag says whether it is JPEG or TIFF strips")
+    test.assert(not exifdata.thumbnail_is_jpeg(empty))
+
+@test
+fn test_gps_needs_four_tags_and_two_sign_conventions() [io]
+    // GPSLatitude is three rationals of degrees, minutes and seconds,
+    // and the SIGN is in GPSLatitudeRef.  A caller that read the first
+    // and not the second puts every southern photograph in the
+    // northern hemisphere.
+    test.case("no GPS tags answer None rather than zero, zero")
+    match exifdata.gps_degrees(exifdata.empty(ExifLittleEndian))
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            match p
+                Some(_) => test.fail("there are no GPS tags")
+                None    => test.assert(true)
+
+@test
+fn test_a_date_is_six_numbers_because_the_field_names_no_moment() [io]
+    // EXIF 2.32 section 4.6.5 writes DateTimeOriginal as
+    // "YYYY:MM:DD HH:MM:SS" with no time zone, so the field does not
+    // name a moment and cannot be converted to one.
+    test.case("absent is None")
+    match exifdata.date_fields(exifdata.empty(ExifLittleEndian), ExifIfdExif, 0x9003)
+        Some(_) => test.fail("there is no date")
+        None    => test.assert(true)
+
+@test
+fn test_a_write_says_what_it_would_lose_before_it_writes() [io]
+    // Rewriting EXIF is not safe, and every library that pretends
+    // otherwise has destroyed somebody's photographs.
+    test.case("the JPEG segment ceiling is stated as a constant")
+    test.assert(exifwrite.EXIF_JPEG_APP1_LIMIT == 65533)
+
+    test.case("a plan answers the size and what moves")
+    match exifwrite.plan(tiff_header(), exifdata.empty(ExifLittleEndian),
+                         ExifContainerTiff)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert(p.block_bytes >= 8)
+            test.assert(p.fits)
+            test.assert(not p.has_maker_note)
+            test.assert(not p.maker_note_moves)
+            test.assert(list.len(p.dropped) == 0)
+
+    test.case("and a plan that loses nothing says so in one call")
+    match exifwrite.plan(tiff_header(), exifdata.empty(ExifLittleEndian),
+                         ExifContainerTiff)
+        Ok(p)  => test.assert(exifwrite.is_lossless(p))
+        Err(e) => test.fail(e.message())
+
+    test.case("the block size is available without building the block")
+    test.assert(exifwrite.block_size(exifdata.empty(ExifLittleEndian)) >= 8)
+
+@test
+fn test_writing_keeps_everything_outside_the_exif_block() [io]
+    test.case("a written TIFF starts with a TIFF header")
+    match exifwrite.write(tiff_header(), exifdata.empty(ExifBigEndian),
+                          ExifContainerTiff)
+        Ok(out) => test.assert(bytes.len(out) >= 8)
+        Err(e)  => test.fail(e.message())
+
+    test.case("the byte order written is the metadata's, so a read-write keeps the file's")
+    match exifwrite.to_tiff_block(exifdata.empty(ExifBigEndian))
+        Ok(out) => test.assert(bytes.byte_at(out, 0) == Some(0x4D))
+        Err(e)  => test.fail(e.message())
+
+    test.case("sniffing the container is the same write with one fewer argument")
+    match exifwrite.write_sniffed(tiff_header(), exifdata.empty(ExifLittleEndian))
+        Ok(out) => test.assert(bytes.len(out) >= 8)
+        Err(e)  => test.fail(e.message())
+
+    test.case("a container with nowhere to put EXIF is refused")
+    match exifwrite.write_sniffed(bytes.from_byte_list([0x47, 0x49, 0x46, 0x38]),
+                                  exifdata.empty(ExifLittleEndian))
+        Ok(_)  => test.fail("a GIF has no place for a TIFF structure")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+
+@test
+fn test_stripping_removes_the_block_and_is_not_an_empty_write() [io]
+    // Writing empty metadata leaves an empty EXIF block; stripping
+    // removes the block, the segment and the chunk.  A published file
+    // must carry no camera serial number, no GPS position and no
+    // thumbnail of an earlier crop.
+    test.case("a stripped file carries no EXIF")
+    match exifwrite.strip(tiff_header())
+        Ok(out) => test.assert(not exifread.has_exif(out))
+        Err(e)  => test.fail(e.message())
+
+    test.case("and stripping a file that had none is not a refusal")
+    match exifwrite.strip(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDB]))
+        Ok(out) => test.assert(bytes.len(out) > 0)
+        Err(e)  => test.fail(e.message())
+
+@test
+fn test_setting_only_the_orientation_moves_nothing() [io]
+    // The narrow write, and the one that is safe: two bytes of an
+    // existing entry, so the MakerNote is untouched and the segment's
+    // length does not change.
+    test.case("a file with no orientation tag cannot be edited in place")
+    match exifwrite.set_orientation(tiff_header(), ExifRotate90)
+        Ok(_)  => test.fail("there is no entry to edit")
+        Err(e) => test.assert(not exiffault.code(e) == "")
+
+    test.case("and writing a wrong type for a tag is refused by name")
+    test.assert(exiffault.code(ExifWrongTypeForTag(0x0112, 2, 3)) == "wrong_type_for_tag")
+    test.assert(exiffault.code(ExifSegmentTooLarge(70000, 65533)) == "segment_too_large")

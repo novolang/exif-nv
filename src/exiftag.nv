@@ -1,0 +1,249 @@
+// exiftag.nv — the five directories, and the table that says what a
+// tag number means in each of them.
+//
+// A TAG NUMBER MEANS NOTHING WITHOUT ITS DIRECTORY
+//
+// EXIF is TIFF, and TIFF numbers its tags per directory.  Tag 0x0001
+// is `InteroperabilityIndex` in the Interoperability IFD, and it is
+// `GPSLatitudeRef` in the GPS IFD.  Tag 0x0100 is `ImageWidth` in the
+// 0th IFD and is not defined in the Exif IFD at all.  So every lookup
+// here takes a directory as well as a number, and a table keyed by
+// number alone — which is what most EXIF libraries ship — is a table
+// that answers the wrong name for a GPS file.
+//
+// THE FIVE DIRECTORIES
+//
+// The 0th IFD describes the main image.  The 1st IFD, reached from the
+// 0th's next-directory pointer, describes the THUMBNAIL.  The Exif IFD
+// holds the photographic tags and is reached through tag 0x8769 in the
+// 0th.  The GPS IFD is reached through tag 0x8825.  The
+// Interoperability IFD is reached through tag 0xA005 in the Exif IFD.
+//
+// Nesting through a tag rather than through the directory chain is
+// what makes EXIF a tree and not a list, and it is why every offset in
+// the structure is relative to the start of the TIFF header rather
+// than to the start of the file.
+//
+// THE TABLE IS DATA, AND IT IS INCOMPLETE ON PURPOSE
+//
+// `tag_at` answers `None` for a tag the table does not carry, and the
+// reader keeps the entry anyway with its number, its type and its
+// bytes.  A private tag, a vendor's tag, a tag added by a version of
+// EXIF newer than this table: all of them survive a read and a write.
+// A library that dropped what it did not recognise would destroy
+// metadata every time it saved a file, which is the single worst thing
+// an EXIF library can do.
+
+// The Orientation tag, 0x0112, in the 0th IFD.
+pub const EXIF_TAG_ORIENTATION = 0x0112
+
+// The ExifIFDPointer tag, 0x8769, in the 0th IFD.
+pub const EXIF_TAG_EXIF_IFD = 0x8769
+
+// The GPSInfoIFDPointer tag, 0x8825, in the 0th IFD.
+pub const EXIF_TAG_GPS_IFD = 0x8825
+
+// The InteroperabilityIFDPointer tag, 0xA005, in the Exif IFD.
+pub const EXIF_TAG_INTEROP_IFD = 0xA005
+
+// The JPEGInterchangeFormat tag, 0x0201, in the 1st IFD: where the
+// thumbnail's bytes start.
+pub const EXIF_TAG_THUMBNAIL_OFFSET = 0x0201
+
+// The JPEGInterchangeFormatLength tag, 0x0202, in the 1st IFD: how
+// long the thumbnail is.
+pub const EXIF_TAG_THUMBNAIL_LENGTH = 0x0202
+
+// The MakerNote tag, 0x927C, in the Exif IFD.
+pub const EXIF_TAG_MAKER_NOTE = 0x927C
+
+// Which directory an entry is in.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     println(exiftag.ifd_name(ExifIfdGps))     // GPS
+// ```
+pub enum ExifIfd
+    // The 0th IFD: the main image's own tags — make, model,
+    // orientation, resolution, the software that wrote the file.
+    ExifIfdPrimary
+    // The 1st IFD: the thumbnail's tags, including where its bytes
+    // are and how long they are.
+    ExifIfdThumbnail
+    // The Exif IFD: the photographic tags — exposure, aperture, ISO,
+    // the date the picture was taken, the lens.
+    ExifIfdExif
+    // The GPS IFD: where the picture was taken, as rationals.
+    ExifIfdGps
+    // The Interoperability IFD: which interoperability rules the file
+    // claims to follow.  Two tags, and almost nothing reads them.
+    ExifIfdInterop
+
+// What the table knows about one tag.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     match exiftag.tag_at(ExifIfdPrimary, 0x0112)
+//         Some(t) => println(t.name)            // Orientation
+//         None    => println("not in the table")
+// ```
+pub struct ExifTag
+    // The tag number.
+    number: Int
+    // Which directory this entry of the table is for.
+    ifd: ExifIfd
+    // The tag's name in EXIF 2.32's own spelling: `Orientation`,
+    // `ExposureTime`, `GPSLatitudeRef`.
+    name: Str
+    // The type EXIF 2.32 says the tag has.  A file that declares a
+    // different one is `ExifTypeMismatch`, which is a finding and not
+    // a refusal.
+    expected_type: ExifType
+    // How many elements the tag should carry, or `-1` when the
+    // specification leaves it open — `ImageDescription` and
+    // `MakerNote` are whatever length they are.
+    expected_count: Int
+
+// The directory's name: `"0th"`, `"1st"`, `"Exif"`, `"GPS"`,
+// `"Interoperability"`.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     println(exiftag.ifd_name(ExifIfdThumbnail))   // 1st
+// ```
+pub fn ifd_name(i: ExifIfd) -> Str []
+    todo("exif-nv.exiftag.ifd_name")
+
+// The tag whose value points at a nested directory, or `None` for the
+// two that are not nested through a tag.
+//
+// `ExifIfdExif` is reached through 0x8769, `ExifIfdGps` through
+// 0x8825, `ExifIfdInterop` through 0xA005.  The 0th IFD is reached
+// from the TIFF header and the 1st from the 0th's next-directory
+// pointer, so neither has one.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     match exiftag.pointer_tag_for(ExifIfdGps)
+//         Some(n) => println("${n}")            // 33922
+//         None    => println("not reached through a tag")
+// ```
+pub fn pointer_tag_for(i: ExifIfd) -> ?Int []
+    todo("exif-nv.exiftag.pointer_tag_for")
+
+// The directory a pointer tag leads to, or `None`.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     match exiftag.ifd_behind_pointer(0x8769)
+//         Some(i) => println(exiftag.ifd_name(i))   // Exif
+//         None    => println("not a pointer tag")
+// ```
+pub fn ifd_behind_pointer(tag: Int) -> ?ExifIfd []
+    todo("exif-nv.exiftag.ifd_behind_pointer")
+
+// What the table knows about a tag in a directory, or `None`.
+//
+// `None` is NOT a refusal.  A private tag, a vendor's tag and a tag
+// from a newer EXIF than this table all answer `None`, and the reader
+// keeps the entry with its number, its type and its bytes so that a
+// rewrite puts it back.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     match exiftag.tag_at(ExifIfdExif, 0x829A)
+//         Some(t) => println(t.name)            // ExposureTime
+//         None    => println("not in the table")
+// ```
+pub fn tag_at(i: ExifIfd, number: Int) -> ?ExifTag []
+    todo("exif-nv.exiftag.tag_at")
+
+// The tag a name denotes in a directory, or `None`.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     match exiftag.tag_named(ExifIfdPrimary, "Orientation")
+//         Some(t) => println("${t.number}")     // 274
+//         None    => println("not in the table")
+// ```
+pub fn tag_named(i: ExifIfd, name: Str) -> ?ExifTag []
+    todo("exif-nv.exiftag.tag_named")
+
+// The tag's name, or a hexadecimal spelling of its number when the
+// table does not carry it: `"Orientation"`, `"0x9999"`.
+//
+// The function a dump tool calls, so that an unknown tag prints as
+// something a person can look up rather than as nothing.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     println(exiftag.name_at(ExifIfdPrimary, 0x0112))   // Orientation
+//     println(exiftag.name_at(ExifIfdPrimary, 0x9999))   // 0x9999
+// ```
+pub fn name_at(i: ExifIfd, number: Int) -> Str []
+    todo("exif-nv.exiftag.name_at")
+
+// Every tag the table carries for a directory, in ascending number
+// order — which is the order TIFF 6.0 requires a directory's entries
+// to be written in.
+//
+// ```novo
+// use std.list
+// use exiftag
+//
+// fn main() [io]
+//     println("${list.len(exiftag.tags_of(ExifIfdGps)) > 0}")   // true
+// ```
+pub fn tags_of(i: ExifIfd) -> [ExifTag] []
+    todo("exif-nv.exiftag.tags_of")
+
+// Whether the table carries this tag in this directory.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     println("${exiftag.is_known(ExifIfdPrimary, 0x0112)}")   // true
+//     println("${exiftag.is_known(ExifIfdExif, 0x0112)}")      // false
+// ```
+pub fn is_known(i: ExifIfd, number: Int) -> Bool []
+    todo("exif-nv.exiftag.is_known")
+
+// Whether a tag's value must not be rewritten in place.
+//
+// TRUE FOR MakerNote, AND THIS IS THE MOST IMPORTANT FUNCTION IN THE
+// MODULE.  A MakerNote is a vendor's private structure inside an
+// `UNDEFINED` field, and several vendors wrote ABSOLUTE file offsets
+// inside it — offsets into the original file, not into the MakerNote.
+// Move the segment and the note points at nothing: the lens
+// correction data, the focus points and the shooting mode are all
+// silently destroyed, and no error is raised anywhere.
+//
+// So a writer that moves the Exif IFD asks this first, and
+// `exifwrite.rewrite_report` says whether a MakerNote was present and
+// whether it moved.
+//
+// ```novo
+// use exiftag
+//
+// fn main() [io]
+//     println("${exiftag.is_offset_fragile(ExifIfdExif, 0x927C)}")   // true
+// ```
+pub fn is_offset_fragile(i: ExifIfd, number: Int) -> Bool []
+    todo("exif-nv.exiftag.is_offset_fragile")

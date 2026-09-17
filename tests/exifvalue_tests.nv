@@ -1,0 +1,170 @@
+// exifvalue_tests.nv — the twelve TIFF types and the two rational
+// forms, against TIFF 6.0 section 2 and EXIF 2.32 section 4.6.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: exif-nv.exifvalue.<fn>`.
+
+use std.test
+use std.bytes
+use exiffault
+use exifvalue
+
+@test
+fn test_the_twelve_type_codes_and_their_sizes() [io]
+    // TIFF 6.0 section 2, table 2.
+    test.case("the codes are 1 to 12, in the specification's order")
+    test.assert(exifvalue.type_code(ExifTypeByte) == 1)
+    test.assert(exifvalue.type_code(ExifTypeAscii) == 2)
+    test.assert(exifvalue.type_code(ExifTypeShort) == 3)
+    test.assert(exifvalue.type_code(ExifTypeLong) == 4)
+    test.assert(exifvalue.type_code(ExifTypeRational) == 5)
+    test.assert(exifvalue.type_code(ExifTypeSbyte) == 6)
+    test.assert(exifvalue.type_code(ExifTypeUndefined) == 7)
+    test.assert(exifvalue.type_code(ExifTypeSshort) == 8)
+    test.assert(exifvalue.type_code(ExifTypeSlong) == 9)
+    test.assert(exifvalue.type_code(ExifTypeSrational) == 10)
+    test.assert(exifvalue.type_code(ExifTypeFloat) == 11)
+    test.assert(exifvalue.type_code(ExifTypeDouble) == 12)
+
+    test.case("the sizes are what an entry's byte length is computed from")
+    test.assert(exifvalue.type_size(ExifTypeByte) == 1)
+    test.assert(exifvalue.type_size(ExifTypeAscii) == 1)
+    test.assert(exifvalue.type_size(ExifTypeShort) == 2)
+    test.assert(exifvalue.type_size(ExifTypeLong) == 4)
+    test.assert(exifvalue.type_size(ExifTypeRational) == 8)
+    test.assert(exifvalue.type_size(ExifTypeDouble) == 8)
+
+    test.case("the names are the specification's own spelling")
+    test.assert(exifvalue.type_name(ExifTypeSrational) == "SRATIONAL")
+    test.assert(exifvalue.type_name(ExifTypeUndefined) == "UNDEFINED")
+
+    test.case("a code round trips, and 13 is not a type")
+    match exifvalue.type_from_code(5)
+        Some(t) => test.assert(exifvalue.type_name(t) == "RATIONAL")
+        None    => test.fail("5 is RATIONAL")
+    match exifvalue.type_from_code(13)
+        Some(_) => test.fail("TIFF 6.0 defines twelve")
+        None    => test.assert(true)
+
+@test
+fn test_the_byte_order_mark_is_two_bytes_and_applies_to_everything() [io]
+    test.case("II is little-endian and MM is big-endian")
+    test.assert(exifvalue.byte_order_mark(ExifLittleEndian) == "II")
+    test.assert(exifvalue.byte_order_mark(ExifBigEndian) == "MM")
+
+    test.case("both are read")
+    match exifvalue.byte_order_from_mark(0x4949)
+        Ok(o)  => test.assert(exifvalue.byte_order_mark(o) == "II")
+        Err(e) => test.fail(e.message())
+    match exifvalue.byte_order_from_mark(0x4D4D)
+        Ok(o)  => test.assert(exifvalue.byte_order_mark(o) == "MM")
+        Err(e) => test.fail(e.message())
+
+    test.case("and anything else is refused")
+    match exifvalue.byte_order_from_mark(0x4D49)
+        Ok(_)  => test.fail("MI is not a byte order")
+        Err(e) => test.assert(exiffault.code(e) == "bad_byte_order")
+
+@test
+fn test_a_rational_stays_two_integers() [io]
+    // THE DECISION THIS PACKAGE IS BUILT ON.  `1/250` is what a camera
+    // displays, what a photographer writes and what the file contains.
+    // Once it is a float nothing can get it back.
+    test.case("it prints as the fraction the file holds")
+    test.assert(exifvalue.format_ratio(
+        ExifRational { numerator: 1, denominator: 250 }) == "1/250")
+
+    test.case("and it is NOT reduced — 10/2000 and 1/200 are different files")
+    test.assert(exifvalue.format_ratio(
+        ExifRational { numerator: 10, denominator: 2000 }) == "10/2000")
+
+    test.case("the float is asked for by name")
+    match exifvalue.to_float(ExifRational { numerator: 1, denominator: 4 })
+        Ok(f)  => test.assert(f == 0.25)
+        Err(e) => test.fail(e.message())
+
+    test.case("a zero denominator is a refusal and not an infinity")
+    // The exposure time a caller is about to print is not a number,
+    // and saying so is more useful than printing `inf`.
+    match exifvalue.to_float(ExifRational { numerator: 1, denominator: 0 })
+        Ok(_)  => test.fail("that is not a number")
+        Err(e) => test.assert(exiffault.code(e) == "zero_denominator")
+
+    test.case("the signed form carries a negative numerator")
+    match exifvalue.srational_to_float(ExifSrational { numerator: 0 - 1, denominator: 2 })
+        Ok(f)  => test.assert(f == 0.0 - 0.5)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_float_becomes_the_fraction_a_camera_would_have_written() [io]
+    // The obvious conversion — multiply by a million and round — gives
+    // `4000/1000000` where a camera writes `1/250`.  The
+    // continued-fraction convergent gives the short spelling.
+    test.case("0.004 with a denominator ceiling of 1000 is 1/250")
+    let r = exifvalue.ratio_from_float(0.004, 1000)
+    test.assert(r.numerator == 1)
+    test.assert(r.denominator == 250)
+
+    test.case("a whole number is over one")
+    let w = exifvalue.ratio_from_float(37.0, 1000)
+    test.assert(w.numerator == 37)
+    test.assert(w.denominator == 1)
+
+    test.case("and the ceiling is honoured")
+    test.assert(exifvalue.ratio_from_float(0.3333333, 10).denominator <= 10)
+
+@test
+fn test_every_value_is_a_list_because_every_entry_has_a_count() [io]
+    test.case("a value knows its own type")
+    test.assert(exifvalue.type_name(exifvalue.type_of(ExifShorts([72]))) == "SHORT")
+    test.assert(exifvalue.type_name(
+        exifvalue.type_of(ExifRationals([]))) == "RATIONAL")
+
+    test.case("the count is the number of elements")
+    test.assert(exifvalue.count_of(ExifShorts([72, 72])) == 2)
+    test.assert(exifvalue.count_of(ExifShorts([])) == 0)
+
+    test.case("the byte length is count times type size")
+    test.assert(exifvalue.byte_length(ExifShorts([72, 72])) == 4)
+    test.assert(exifvalue.byte_length(
+        ExifRationals([ExifRational { numerator: 1, denominator: 1 }])) == 8)
+
+    test.case("four bytes or fewer fits the entry's inline field")
+    test.assert(exifvalue.fits_inline(ExifShorts([72, 72])))
+    test.assert(not exifvalue.fits_inline(ExifShorts([1, 2, 3])))
+
+    test.case("the first element is asked for by name, never assumed")
+    match exifvalue.first_int(ExifShorts([6]))
+        Some(n) => test.assert(n == 6)
+        None    => test.fail("there is one")
+    match exifvalue.first_int(ExifShorts([]))
+        Some(_) => test.fail("there is none")
+        None    => test.assert(true)
+    match exifvalue.first_ratio(ExifRationals([ExifRational { numerator: 1, denominator: 250 }]))
+        Some(r) => test.assert(r.denominator == 250)
+        None    => test.fail("there is one")
+    match exifvalue.first_ratio(ExifShorts([6]))
+        Some(_) => test.fail("a SHORT is not a RATIONAL")
+        None    => test.assert(true)
+
+@test
+fn test_ascii_counts_its_trailing_nul_and_is_read_leniently() [io]
+    // TIFF 6.0 says the field is ASCII with a trailing NUL and that
+    // the count includes it.  Real files carry UTF-8, Shift JIS, and
+    // fields with no NUL at all.
+    test.case("a written value carries the NUL in its count")
+    test.assert(exifvalue.count_of(exifvalue.ascii_value("Canon")) == 6)
+
+    test.case("reading drops one trailing NUL")
+    test.assert(exifvalue.ascii_text(exifvalue.ascii_value("Canon")) == "Canon")
+
+    test.case("a field with no NUL is read anyway, not refused")
+    test.assert(exifvalue.ascii_text(ExifAscii(bytes.from_str("NIKON"))) == "NIKON")
+
+    test.case("and a non-ASCII field is read rather than refused")
+    test.assert(exifvalue.ascii_text(ExifAscii(bytes.from_str("Zoë"))) == "Zoë")
+
+    test.case("the raw bytes survive for a caller that needs to know")
+    match ExifAscii(bytes.from_str("Canon"))
+        ExifAscii(raw) => test.assert(bytes.len(raw) == 5)
+        _              => test.fail("that is an ASCII value")
