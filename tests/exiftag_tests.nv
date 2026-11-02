@@ -1,9 +1,6 @@
 // exiftag_tests.nv — the five directories and the tag table, against
 // EXIF 2.32 section 4.6 and TIFF 6.0 section 2.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: exif-nv.exiftag.<fn>`.
-
 use std.test
 use std.list
 use exiftag

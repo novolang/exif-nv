@@ -24,6 +24,8 @@
 // the predicate that separates the two, and `exifread.read_report` is
 // the function that hands back both.
 
+use std.str
+
 // Why EXIF could not be read or written.
 //
 // ```novo
@@ -86,10 +88,52 @@ pub enum ExifFault
 // exist at all.
 impl Error for ExifFault
     // The one-line message, naming the tag and the offset.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("exif-nv.ExifFault.message")
+        match self
+            ExifNoExif                                           => "no EXIF metadata in this container"
+            ExifUnknownContainer                                 => "these bytes are not a JPEG, a PNG or a TIFF"
+            ExifBadByteOrder(offset, found)                      =>
+                "the byte-order mark at offset " + str.from_int(offset)
+                    + " is neither II nor MM; it is " + str.from_int(found)
+            ExifBadMagic(offset, found)                          =>
+                "the TIFF magic number at offset " + str.from_int(offset)
+                    + " is " + str.from_int(found) + ", not 42"
+            ExifDirectoryTruncated(offset, entries, available)   =>
+                "the directory at offset " + str.from_int(offset) + " declares "
+                    + str.from_int(entries) + " entries and only "
+                    + str.from_int(available) + " bytes follow"
+            ExifOffsetOutOfRange(offset, tag, pointed_at, limit) =>
+                "tag " + str.from_int(tag) + " at offset " + str.from_int(offset)
+                    + " points at " + str.from_int(pointed_at)
+                    + ", past the end of the block at " + str.from_int(limit)
+            ExifUnknownType(offset, tag, type_code)              =>
+                "tag " + str.from_int(tag) + " at offset " + str.from_int(offset)
+                    + " declares type code " + str.from_int(type_code)
+                    + ", which is not one of the twelve TIFF 6.0 defines"
+            ExifTypeMismatch(offset, tag, declared, expected)    =>
+                "tag " + str.from_int(tag) + " at offset " + str.from_int(offset)
+                    + " is declared type " + str.from_int(declared)
+                    + " where the tag table says " + str.from_int(expected)
+            ExifCountMismatch(offset, tag, declared, expected)   =>
+                "tag " + str.from_int(tag) + " at offset " + str.from_int(offset)
+                    + " carries " + str.from_int(declared)
+                    + " values where the tag table says " + str.from_int(expected)
+            ExifZeroDenominator(offset, tag)                     =>
+                "tag " + str.from_int(tag) + " at offset " + str.from_int(offset)
+                    + " is a rational with a zero denominator"
+            ExifDirectoryLoop(offset)                            =>
+                "the directory chain loops back to offset " + str.from_int(offset)
+            ExifTooManyDirectories(limit)                        =>
+                "more than " + str.from_int(limit) + " directories"
+            ExifWrongTypeForTag(tag, given, expected)            =>
+                "tag " + str.from_int(tag) + " was given a value of type "
+                    + str.from_int(given) + "; the tag table says "
+                    + str.from_int(expected)
+            ExifSegmentTooLarge(bytes_needed, limit)             =>
+                "the EXIF segment would need " + str.from_int(bytes_needed)
+                    + " bytes; a JPEG APP1 segment holds " + str.from_int(limit)
+            ExifContainerCannotCarry                             =>
+                "this container has nowhere to put a TIFF structure"
 
 // The byte offset the refusal is about, or `-1` when it is about the
 // whole file or a caller's argument.
@@ -102,7 +146,17 @@ impl Error for ExifFault
 //     println("${exiffault.offset_of(ExifNoExif)}")            // -1
 // ```
 pub fn offset_of(f: ExifFault) -> Int []
-    todo("exif-nv.exiffault.offset_of")
+    match f
+        ExifBadByteOrder(offset, _)           => offset
+        ExifBadMagic(offset, _)               => offset
+        ExifDirectoryTruncated(offset, _, _)  => offset
+        ExifOffsetOutOfRange(offset, _, _, _) => offset
+        ExifUnknownType(offset, _, _)         => offset
+        ExifTypeMismatch(offset, _, _, _)     => offset
+        ExifCountMismatch(offset, _, _, _)    => offset
+        ExifZeroDenominator(offset, _)        => offset
+        ExifDirectoryLoop(offset)             => offset
+        _                                     => 0 - 1
 
 // The tag number the refusal is about, or `-1`.
 //
@@ -113,7 +167,14 @@ pub fn offset_of(f: ExifFault) -> Int []
 //     println("${exiffault.tag_of(ExifZeroDenominator(120, 0x829A))}")   // 33434
 // ```
 pub fn tag_of(f: ExifFault) -> Int []
-    todo("exif-nv.exiffault.tag_of")
+    match f
+        ExifOffsetOutOfRange(_, tag, _, _) => tag
+        ExifUnknownType(_, tag, _)         => tag
+        ExifTypeMismatch(_, tag, _, _)     => tag
+        ExifCountMismatch(_, tag, _, _)    => tag
+        ExifZeroDenominator(_, tag)        => tag
+        ExifWrongTypeForTag(tag, _, _)     => tag
+        _                                  => 0 - 1
 
 // A short stable code for logs and metrics: `"no_exif"`,
 // `"bad_magic"`, `"type_mismatch"`, and so on.
@@ -125,7 +186,22 @@ pub fn tag_of(f: ExifFault) -> Int []
 //     println(exiffault.code(ExifNoExif))       // no_exif
 // ```
 pub fn code(f: ExifFault) -> Str []
-    todo("exif-nv.exiffault.code")
+    match f
+        ExifNoExif                       => "no_exif"
+        ExifUnknownContainer             => "unknown_container"
+        ExifBadByteOrder(_, _)           => "bad_byte_order"
+        ExifBadMagic(_, _)               => "bad_magic"
+        ExifDirectoryTruncated(_, _, _)  => "directory_truncated"
+        ExifOffsetOutOfRange(_, _, _, _) => "offset_out_of_range"
+        ExifUnknownType(_, _, _)         => "unknown_type"
+        ExifTypeMismatch(_, _, _, _)     => "type_mismatch"
+        ExifCountMismatch(_, _, _, _)    => "count_mismatch"
+        ExifZeroDenominator(_, _)        => "zero_denominator"
+        ExifDirectoryLoop(_)             => "directory_loop"
+        ExifTooManyDirectories(_)        => "too_many_directories"
+        ExifWrongTypeForTag(_, _, _)     => "wrong_type_for_tag"
+        ExifSegmentTooLarge(_, _)        => "segment_too_large"
+        ExifContainerCannotCarry         => "container_cannot_carry"
 
 // Whether this refusal makes the structure unreadable, as opposed to
 // spoiling one entry.
@@ -146,4 +222,14 @@ pub fn code(f: ExifFault) -> Str []
 //     println("${exiffault.is_fatal(ExifTypeMismatch(120, 0x010F, 3, 2))}")   // false
 // ```
 pub fn is_fatal(f: ExifFault) -> Bool []
-    todo("exif-nv.exiffault.is_fatal")
+    // The five that stop the walk: without a byte order, a magic number
+    // or an entry count a reader cannot take a step at all, and a chain
+    // that loops or never ends is a reader that does not terminate.
+    // Everything else spoils one entry and is carried as a finding.
+    match f
+        ExifBadByteOrder(_, _)          => true
+        ExifBadMagic(_, _)              => true
+        ExifDirectoryTruncated(_, _, _) => true
+        ExifDirectoryLoop(_)            => true
+        ExifTooManyDirectories(_)       => true
+        _                               => false

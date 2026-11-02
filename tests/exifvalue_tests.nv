@@ -1,9 +1,6 @@
 // exifvalue_tests.nv — the twelve TIFF types and the two rational
 // forms, against TIFF 6.0 section 2 and EXIF 2.32 section 4.6.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: exif-nv.exifvalue.<fn>`.
-
 use std.test
 use std.bytes
 use exiffault

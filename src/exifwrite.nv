@@ -28,7 +28,775 @@
 // holds its own numbers in the file's byte order, and a rewrite that
 // changed it would make the note unreadable even if nothing moved.
 
+use std.bytes
+use std.codec
+use std.float
+use std.list
+use std.math
 use exifdata
+use exiffault
+use exiforient
+use exifread
+use exiftag
+use exifvalue
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// A byte at an offset, or `d` when the buffer is shorter than that.
+fn byte_or(source: Bytes, i: Int, d: Int) -> Int
+    bytes.byte_at(source, i) ?? d
+
+// Two bytes as an unsigned number, in the file's own byte order.
+fn read_at16(source: Bytes, off: Int, order: ExifByteOrder) -> Int
+    if order == ExifLittleEndian
+        bytes.u16_le_at(source, off) ?? 0
+    else
+        bytes.u16_be_at(source, off) ?? 0
+
+// Four bytes as an unsigned number.
+fn read_at32(source: Bytes, off: Int, order: ExifByteOrder) -> Int
+    if order == ExifLittleEndian
+        bytes.u32_le_at(source, off) ?? 0
+    else
+        bytes.u32_be_at(source, off) ?? 0
+
+// A number into the buffer, in the file's own byte order.  The
+// argument must be a `var` name, which is why every writer here takes
+// `var buf` rather than `buf`.
+fn put16(var buf: Bytes, at: Int, v: Int, order: ExifByteOrder)
+    if order == ExifLittleEndian
+        bytes.set_u16_le(buf, at, v)
+    else
+        bytes.set_u16_be(buf, at, v)
+
+fn put32(var buf: Bytes, at: Int, v: Int, order: ExifByteOrder)
+    if order == ExifLittleEndian
+        bytes.set_u32_le(buf, at, v)
+    else
+        bytes.set_u32_be(buf, at, v)
+
+fn put64(var buf: Bytes, at: Int, v: Int, order: ExifByteOrder)
+    if order == ExifLittleEndian
+        bytes.set_u64_le(buf, at, v)
+    else
+        bytes.set_u64_be(buf, at, v)
+
+// Which end of a multi-byte number comes first in this file, or a
+// refusal naming the two bytes that were there instead.
+fn order_of(source: Bytes, base: Int) -> Result<ExifByteOrder, ExifFault> []
+    let b0 = bytes.byte_at(source, base)
+    let b1 = bytes.byte_at(source, base + 1)
+    match (b0, b1)
+        (Some(73), Some(73)) => Ok(ExifLittleEndian)
+        (Some(77), Some(77)) => Ok(ExifBigEndian)
+        _                    => Err(ExifBadByteOrder(base, (b0 ?? 0 - 1) * 256 + (b1 ?? 0 - 1)))
+
+// One element of a type code, or zero for a code TIFF does not
+// define.
+fn size_of_code(code: Int) -> Int
+    match exifvalue.type_from_code(code)
+        Some(t) => exifvalue.type_size(t)
+        None    => 0
+
+// Which power of two a positive float sits between: the exact
+// `floor(log2(a))`, corrected a step at a time.
+fn exponent_of(a: Float) -> Int
+    var e = math.log2(a) as Int
+    var p = math.pow(2.0, e as Float)
+    var down = 0
+    while p > a and down < 4
+        e = e - 1
+        p = p * 0.5
+        down = down + 1
+    // The down-loop leaves the guess at or below `a`, and a value that
+    // is exactly a power of two — the only case the truncated `log2`
+    // answers too low — is left alone above.  The loop stays as the
+    // bound the doc comment promises, over a host whose `log2` is off.
+    var up = 0
+    // cov: skip — unreachable second correction, kept against a host whose `log2` is off
+    while p * 2.0 <= a and up < 8
+        e = e + 1
+        p = p * 2.0
+        up = up + 1
+    e
+
+// The 32 bits IEEE-754 gives a float.  The arithmetic lives on the
+// writing side alone: `exifread` decodes what this encodes and has no
+// use for the other direction.
+//
+// The sign comes from the bit pattern rather than from a comparison:
+// `-0.0 < 0.0` is false, so a negative zero read from a file would
+// come back positive if the sign were asked for with `<`.
+fn bits_from_float32(value: Float) -> Int
+    let sign = if float.to_bits(value) < 0
+        0x80000000
+    else
+        0
+    let a = math.abs(value)
+    if a == 0.0
+        sign
+    elif math.is_nan(value)
+        sign | 0x7FC00000
+    elif math.is_inf(value)
+        sign | 0x7F800000
+    elif a < math.pow(2.0, 0.0 - 126.0)
+        sign | math.round(a / math.pow(2.0, 0.0 - 149.0)) as Int
+    else
+        let e = exponent_of(a)
+        if e > 127
+            sign | 0x7F800000
+        else
+            let f = math.round((a / math.pow(2.0, e as Float) - 1.0) * 8388608.0) as Int
+            if f >= 8388608
+                sign | ((e + 128) << 23)
+            else
+                sign | (((e + 127) << 23) | f)
+
+// The 64 bits IEEE-754 gives a double.  The sign bit lands in the
+// Int's own sign, which is what lets `put64` store it unchanged.  The
+// sign is read from the bits, so a negative zero survives as one.
+fn bits_from_double(value: Float) -> Int
+    let sign = if float.to_bits(value) < 0
+        1 << 63
+    else
+        0
+    let a = math.abs(value)
+    let smallest = math.pow(2.0, 0.0 - 1022.0)
+    if a == 0.0
+        sign
+    elif math.is_nan(value)
+        sign | 0x7FF8000000000000
+    elif math.is_inf(value)
+        sign | 0x7FF0000000000000
+    elif a < smallest
+        sign | math.round(a / smallest * 4503599627370496.0) as Int
+    else
+        let e = exponent_of(a)
+        if e > 1023
+            // cov: skip — a finite double's exponent is at most 1023
+            sign | 0x7FF0000000000000
+        else
+            let f = math.round((a / math.pow(2.0, e as Float) - 1.0) * 4503599627370496.0) as Int
+            if f >= 4503599627370496
+                // cov: skip — a double's mantissa is an exact integer below 2^52
+                sign | ((e + 1024) << 52)
+            else
+                sign | (((e + 1023) << 52) | f)
+
+// One value's bytes, written at `at`.  The arm says how the bytes go
+// together and the DECLARED type says how wide one element is, which
+// is what keeps an SBYTE, an SSHORT and an SLONG — one arm each for a
+// reader — at their own widths.
+fn put_value(var buf: Bytes, at: Int, e: ExifEntry, order: ExifByteOrder)
+    let t = e.declared_type
+    match e.value
+        ExifBytes(data)    =>
+            bytes.copy_into(buf, at, data, 0, bytes.len(data))
+        ExifAscii(data)    =>
+            bytes.copy_into(buf, at, data, 0, bytes.len(data))
+        ExifShorts(xs)     =>
+            for i in 0..list.len(xs)
+                put16(var buf, at + i * 2, list.get(xs, i), order)
+        ExifLongs(xs)      =>
+            for i in 0..list.len(xs)
+                put32(var buf, at + i * 4, list.get(xs, i), order)
+        ExifRationals(rs)  =>
+            for i in 0..list.len(rs)
+                let r = list.get(rs, i)
+                put32(var buf, at + i * 8, r.numerator, order)
+                put32(var buf, at + i * 8 + 4, r.denominator, order)
+        ExifSigneds(xs)    =>
+            let width = exifvalue.type_size(t)
+            for i in 0..list.len(xs)
+                match width
+                    1 => bytes.set_u8(buf, at + i, list.get(xs, i))
+                    2 => put16(var buf, at + i * 2, list.get(xs, i), order)
+                    _ => put32(var buf, at + i * 4, list.get(xs, i), order)
+        ExifSrationals(rs) =>
+            for i in 0..list.len(rs)
+                let r = list.get(rs, i)
+                put32(var buf, at + i * 8, r.numerator, order)
+                put32(var buf, at + i * 8 + 4, r.denominator, order)
+        ExifFloats(xs)     =>
+            if t == ExifTypeDouble
+                for i in 0..list.len(xs)
+                    put64(var buf, at + i * 8, bits_from_double(list.get(xs, i)), order)
+            else
+                for i in 0..list.len(xs)
+                    put32(var buf, at + i * 4, bits_from_float32(list.get(xs, i)), order)
+// A value that fits the four bytes an entry holds inline, and the
+// zeros after it: an entry's value field is four bytes whatever the
+// value is.
+fn put_inline(var buf: Bytes, at: Int, e: ExifEntry, order: ExifByteOrder)
+    let size = exifvalue.count_of(e.value) * exifvalue.type_size(e.declared_type)
+    put_value(var buf, at, e, order)
+    if size < 4
+        bytes.fill(buf, at + size, 4 - size, 0)
+
+// How many bytes this entry's value occupies: its count times one
+// element of the type the FILE declared.
+fn entry_bytes(e: ExifEntry) -> Int
+    exifvalue.count_of(e.value) * exifvalue.type_size(e.declared_type)
+
+// The tags the writer lays down itself rather than copying out of the
+// metadata: the three pointers to sub-directories, and the
+// thumbnail's own offset and length, which name where the writer puts
+// things rather than where the file did.
+fn is_writer_tag(tag: Int) -> Bool
+    tag == exiftag.EXIF_TAG_EXIF_IFD
+        or tag == exiftag.EXIF_TAG_GPS_IFD
+        or tag == exiftag.EXIF_TAG_INTEROP_IFD
+        or tag == exiftag.EXIF_TAG_THUMBNAIL_OFFSET
+        or tag == exiftag.EXIF_TAG_THUMBNAIL_LENGTH
+
+// The tags that name image data inside the file the structure came
+// from.  A rebuilt structure has moved that image data, so these are
+// dropped and reported in the plan rather than written pointing at
+// nothing.
+fn is_strip_tag(tag: Int) -> Bool
+    tag == 0x0111 or tag == 0x0117 or tag == 0x0144 or tag == 0x0145
+
+// The thumbnail's span, or a zero-length one when there is none — so
+// that a caller has a span to read either way.
+fn thumbnail_or_zero(d: ExifData) -> ExifSpan
+    match exifdata.thumbnail_span(d)
+        Some(span) => span
+        None       => ExifSpan { start: 0, length: 0 }
+
+fn thumbnail_length(d: ExifData) -> Int
+    let span = thumbnail_or_zero(d)
+    span.length
+
+// Whether the bytes the metadata's thumbnail span names are really in
+// this buffer.
+fn thumbnail_here(source: Bytes, d: ExifData) -> Bool
+    let span = thumbnail_or_zero(d)
+    span.length > 0 and span.start >= 0 and span.start + span.length <= bytes.len(source)
+
+// The entries one directory is written with, in ascending tag order:
+// everything the metadata holds for it, minus the tags the writer
+// owns, plus the pointer entries that name the directories hanging
+// off it and, for the 1st IFD, the thumbnail's own two.
+fn written_entries(d: ExifData, ifd: ExifIfd) -> [ExifEntry]
+    var out: [ExifEntry] = []
+    for e in d.entries
+        if e.ifd == ifd and not is_writer_tag(e.tag) and not is_strip_tag(e.tag)
+            list.push(out, e)
+    if ifd == ExifIfdPrimary
+        if exifdata.has_ifd(d, ExifIfdExif)
+            list.push(out, ExifEntry {
+                ifd: ifd,
+                tag: exiftag.EXIF_TAG_EXIF_IFD,
+                declared_type: ExifTypeLong,
+                value: ExifLongs([0]),
+                offset: 0 - 1 })
+        if exifdata.has_ifd(d, ExifIfdGps)
+            list.push(out, ExifEntry {
+                ifd: ifd,
+                tag: exiftag.EXIF_TAG_GPS_IFD,
+                declared_type: ExifTypeLong,
+                value: ExifLongs([0]),
+                offset: 0 - 1 })
+    if ifd == ExifIfdExif
+        if exifdata.has_ifd(d, ExifIfdInterop)
+            list.push(out, ExifEntry {
+                ifd: ifd,
+                tag: exiftag.EXIF_TAG_INTEROP_IFD,
+                declared_type: ExifTypeLong,
+                value: ExifLongs([0]),
+                offset: 0 - 1 })
+    if ifd == ExifIfdThumbnail and thumbnail_length(d) > 0
+        list.push(out, ExifEntry {
+            ifd: ifd,
+            tag: exiftag.EXIF_TAG_THUMBNAIL_OFFSET,
+            declared_type: ExifTypeLong,
+            value: ExifLongs([0]),
+            offset: 0 - 1 })
+        list.push(out, ExifEntry {
+            ifd: ifd,
+            tag: exiftag.EXIF_TAG_THUMBNAIL_LENGTH,
+            declared_type: ExifTypeLong,
+            value: ExifLongs([thumbnail_length(d)]),
+            offset: 0 - 1 })
+    list.sort_by(out, e => e.tag)
+    out
+
+// Which directories the block carries, in the order they are laid
+// down.  The 0th IFD is always there, because a TIFF structure with
+// no directories at all is not one; the rest are there when they have
+// something to say or something to point at.
+fn written_ifds(d: ExifData) -> [ExifIfd]
+    var out: [ExifIfd] = []
+    list.push(out, ExifIfdPrimary)
+    if thumbnail_length(d) > 0
+        list.push(out, ExifIfdThumbnail)
+    if exifdata.has_ifd(d, ExifIfdExif)
+        list.push(out, ExifIfdExif)
+    if exifdata.has_ifd(d, ExifIfdGps)
+        list.push(out, ExifIfdGps)
+    if exifdata.has_ifd(d, ExifIfdInterop)
+        list.push(out, ExifIfdInterop)
+    out
+
+// A directory's size: a count, its entries, and the next-directory
+// pointer.
+fn dir_bytes(n: Int) -> Int
+    2 + n * 12 + 4
+
+// How many bytes one directory's out-of-line values need.  Every one
+// of them is padded to an even length, which is what TIFF 6.0 asks
+// for and what makes a value's offset in one write the same as in the
+// next.
+fn value_bytes(d: ExifData, ifd: ExifIfd) -> Int
+    var total = 0
+    for e in written_entries(d, ifd)
+        let size = entry_bytes(e)
+        if size > 4
+            total = total + size + size % 2
+    total
+
+// Where everything in a block goes: the same numbers the writer lays
+// the block out with, so the plan and the bytes agree by
+// construction.
+struct ExifBlockLayout
+    // The directories that are written, in order, with the offset
+    // each begins at.
+    dirs: [(ExifIfd, Int)]
+    // Where a value too large for an entry's four inline bytes goes.
+    values_at: Int
+    // Where the thumbnail's bytes go.
+    thumbnail_at: Int
+    // The whole block's length.
+    total: Int
+
+fn layout_of(d: ExifData) -> ExifBlockLayout
+    let ifds = written_ifds(d)
+    var dirs: [(ExifIfd, Int)] = []
+    var at = 8
+    for i in ifds
+        list.push(dirs, (i, at))
+        at = at + dir_bytes(list.len(written_entries(d, i)))
+    let values_at = at
+    for j in ifds
+        at = at + value_bytes(d, j)
+    let thumbnail_at = at + at % 2
+    at = thumbnail_at + thumbnail_length(d)
+    ExifBlockLayout {
+        dirs: dirs,
+        values_at: values_at,
+        thumbnail_at: thumbnail_at,
+        total: at }
+
+// The offset a directory begins at, or zero when it is not written.
+fn dir_offset(l: ExifBlockLayout, ifd: ExifIfd) -> Int
+    var found = 0
+    for p in l.dirs
+        if p.0 == ifd
+            found = p.1
+    found
+
+// The next directory on the chain.  Only the 0th IFD has one: the
+// 1st IFD follows it, and the sub-directories hang off pointer
+// entries rather than off the chain.
+fn next_offset(l: ExifBlockLayout, ifd: ExifIfd) -> Int
+    if ifd == ExifIfdPrimary
+        dir_offset(l, ExifIfdThumbnail)
+    else
+        0
+
+// The four bytes of one entry's value field, for an entry whose value
+// is written inline.
+//
+// The two kinds of entry the writer lays down itself are written from
+// the layout rather than from the value they carry: a pointer entry
+// and the thumbnail's offset hold a placeholder zero, because where
+// the directory or the thumbnail they name goes is not known until the
+// whole block has been laid out.  The count of an entry is not touched
+// here, so the thumbnail's length is its value like any other.
+fn put_entry_field(var buf: Bytes, at: Int, e: ExifEntry, l: ExifBlockLayout, order: ExifByteOrder)
+    if e.tag == exiftag.EXIF_TAG_THUMBNAIL_OFFSET
+        put32(var buf, at, l.thumbnail_at, order)
+    else
+        match exiftag.ifd_behind_pointer(e.tag)
+            Some(sub) => put32(var buf, at, dir_offset(l, sub), order)
+            None      => put_inline(var buf, at, e, order)
+
+// Where the writer would put one entry's value, or `None` when that
+// entry is not written out of line.  This is the number the MakerNote
+// warning is made of.
+fn value_offset_of(l: ExifBlockLayout, d: ExifData, ifd: ExifIfd, tag: Int) -> ?Int
+    var at = l.values_at
+    var found: ?Int = None
+    for p in l.dirs
+        for e in written_entries(d, p.0)
+            let size = entry_bytes(e)
+            if size > 4
+                if p.0 == ifd and e.tag == tag
+                    found = Some(at)
+                at = at + size + size % 2
+    found
+
+// The TIFF structure on its own.  The thumbnail's bytes are left as
+// zeros: they live in a buffer this function was not given, and
+// `write` copies them in.
+fn build_block(d: ExifData) -> Bytes
+    let l = layout_of(d)
+    var buf = bytes.zeros(l.total)
+    if d.byte_order == ExifLittleEndian
+        bytes.set_u8(buf, 0, 0x49)
+        bytes.set_u8(buf, 1, 0x49)
+    else
+        bytes.set_u8(buf, 0, 0x4D)
+        bytes.set_u8(buf, 1, 0x4D)
+    put16(var buf, 2, 42, d.byte_order)
+    put32(var buf, 4, dir_offset(l, ExifIfdPrimary), d.byte_order)
+    var values = l.values_at
+    for p in l.dirs
+        let ifd = p.0
+        let at = p.1
+        let es = written_entries(d, ifd)
+        put16(var buf, at, list.len(es), d.byte_order)
+        var cursor = at + 2
+        for k in 0..list.len(es)
+            let e = list.get(es, k)
+            let size = entry_bytes(e)
+            put16(var buf, cursor, e.tag, d.byte_order)
+            put16(var buf, cursor + 2, exifvalue.type_code(e.declared_type), d.byte_order)
+            put32(var buf, cursor + 4, exifvalue.count_of(e.value), d.byte_order)
+            if size <= 4
+                put_entry_field(var buf, cursor + 8, e, l, d.byte_order)
+            else
+                put32(var buf, cursor + 8, values, d.byte_order)
+                put_value(var buf, values, e, d.byte_order)
+                values = values + size + size % 2
+            cursor = cursor + 12
+        put32(var buf, cursor, next_offset(l, ifd), d.byte_order)
+    buf
+
+// The block with the thumbnail's bytes copied into the place the
+// layout reserved for them.
+fn block_with_thumbnail(source: Bytes, d: ExifData) -> Bytes
+    var buf = build_block(d)
+    if thumbnail_here(source, d)
+        let l = layout_of(d)
+        let span = thumbnail_or_zero(d)
+        bytes.copy_into(buf, l.thumbnail_at, source, span.start, span.length)
+    buf
+
+// Whether the metadata's entries hold one for this directory and tag.
+fn holds_entry(d: ExifData, ifd: ExifIfd, tag: Int) -> Bool
+    match exifdata.entry(d, ifd, tag)
+        Some(_) => true
+        None    => false
+
+// A directory as a number, for the plan's `dropped` pairs, which are
+// Ints: the order the enum declares them in, 0th first.
+fn ifd_number(i: ExifIfd) -> Int
+    match i
+        ExifIfdPrimary   => 0
+        ExifIfdThumbnail => 1
+        ExifIfdExif      => 2
+        ExifIfdGps       => 3
+        ExifIfdInterop   => 4
+
+// What the rewrite loses from what the source held: a strip tag, which
+// names image data the rebuilt structure no longer sits beside, or an
+// entry the metadata no longer carries.
+fn dropped_from(before: ExifData, after: ExifData) -> [(Int, Int)]
+    var out: [(Int, Int)] = []
+    for e in before.entries
+        if is_strip_tag(e.tag)
+            list.push(out, (ifd_number(e.ifd), e.tag))
+        elif not holds_entry(after, e.ifd, e.tag)
+            list.push(out, (ifd_number(e.ifd), e.tag))
+    out
+
+fn dropped_between(source: Bytes, d: ExifData) -> [(Int, Int)]
+    let report = exifread.read_report(source, exifread.default_options())
+    match report
+        Ok(r)  =>
+            match r
+                Some(rep) =>
+                    let before = rep.data
+                    dropped_from(before, d)
+                None      => []
+        Err(_) => []
+
+// Whether a source carries a thumbnail at all: what tells a plan
+// whether there is one to lose.
+fn source_has_thumbnail(source: Bytes) -> Bool
+    let report = exifread.read_report(source, exifread.default_options())
+    match report
+        Ok(r)  =>
+            match r
+                Some(rep) =>
+                    let before = rep.data
+                    match exifdata.thumbnail_span(before)
+                        Some(_) => true
+                        None    => false
+                None      => false
+        Err(_) => false
+
+// Whether the thumbnail survives: nothing to lose, or the metadata's
+// span really names bytes of the buffer being written.
+fn thumbnail_kept(source: Bytes, d: ExifData) -> Bool
+    if source_has_thumbnail(source)
+        thumbnail_here(source, d)
+    else
+        true
+
+// Whether the metadata carries a MakerNote, which is the thing a plan
+// warns about.
+fn carries_maker_note(d: ExifData) -> Bool
+    holds_entry(d, ExifIfdExif, exiftag.EXIF_TAG_MAKER_NOTE)
+
+// Where an entry's value begins in a directory of the source, or
+// `None`.  A light walk: the plan needs one offset out of the old
+// file, not the metadata.
+fn entry_value_at(source: Bytes, base: Int, dir: Int, tag: Int, order: ExifByteOrder) -> ?Int
+    let at = dir
+    if at + 2 > bytes.len(source)
+        return None
+    let count = read_at16(source, at, order)
+    if at + 2 + count * 12 + 4 > bytes.len(source)
+        return None
+    var found: ?Int = None
+    var i = 0
+    while i < count
+        let off = at + 2 + i * 12
+        if read_at16(source, off, order) == tag
+            let t = read_at16(source, off + 2, order)
+            let n = read_at32(source, off + 4, order)
+            let size = n * size_of_code(t)
+            if size <= 4
+                found = Some(off + 8)
+            else
+                found = Some(base + read_at32(source, off + 8, order))
+        i = i + 1
+    found
+
+// Where the source's MakerNote value sat, relative to the start of its
+// TIFF structure, or `None` when it has none.
+//
+// A note's contents hold absolute file offsets in several vendors'
+// layouts, so the warning is a comparison of this number with the one
+// the rewrite would use.
+fn source_maker_note_at(source: Bytes) -> ?Int
+    match exifread.tiff_offset(source)
+        Some(base) =>
+            match order_of(source, base)
+                Err(_)    => None
+                Ok(order) =>
+                    if read_at16(source, base + 2, order) != 42
+                        None
+                    else
+                        let first = base + read_at32(source, base + 4, order)
+                        match entry_value_at(source, base, first, exiftag.EXIF_TAG_EXIF_IFD, order)
+                            None        => None
+                            Some(field) =>
+                                let exif_dir = base + read_at32(source, field, order)
+                                let note = entry_value_at(source, base, exif_dir, exiftag.EXIF_TAG_MAKER_NOTE, order)
+                                match note
+                                    None          => None
+                                    Some(note_at) => Some(note_at - base)
+        None       => None
+
+// The length of the first PNG chunk, which is where a `eXIf` chunk
+// goes when there is one.
+fn first_chunk_length(source: Bytes) -> Int
+    if bytes.len(source) < 12
+        0
+    else
+        read_at32(source, 8, ExifBigEndian)
+
+// Where the writer will put the TIFF structure in the container it is
+// about to produce, which is what an absolute comparison of the
+// MakerNote's position needs.
+fn new_block_base(source: Bytes, c: ExifContainer) -> Int
+    match c
+        ExifContainerJpeg => 12
+        ExifContainerPng  => 20 + first_chunk_length(source)
+        _                 => 0
+
+// Whether the write would move the MakerNote, which is the warning
+// this package exists for.  True when there is a note and the source's
+// copy of it cannot be found, because a rewrite that cannot compare
+// the two is a rewrite that may have moved it.
+fn maker_note_moved(source: Bytes, d: ExifData, c: ExifContainer) -> Bool
+    if not carries_maker_note(d)
+        false
+    else
+        match source_maker_note_at(source)
+            None      => true
+            Some(was) =>
+                let l = layout_of(d)
+                let now = value_offset_of(l, d, ExifIfdExif, exiftag.EXIF_TAG_MAKER_NOTE) ?? 0 - 1
+                match exifread.tiff_offset(source)
+                    // cov: skip — finding the note above already required a TIFF offset
+                    None       => true
+                    Some(base) =>
+                        base + was != new_block_base(source, c) + now
+
+// Whether a JPEG APP1 segment of this size is allowed.
+fn fits_in(c: ExifContainer, total: Int) -> Bool
+    if c == ExifContainerJpeg
+        total + 6 <= EXIF_JPEG_APP1_LIMIT
+    else
+        true
+
+// Where the orientation entry's twelve bytes sit, or `None` when
+// there is none.  A declared type that is not a SHORT is refused by
+// name rather than edited: two bytes are what this write promises to
+// touch.
+fn orientation_entry_at(source: Bytes, base: Int,
+                        order: ExifByteOrder) -> Result<?Int, ExifFault> []
+    let at = base + read_at32(source, base + 4, order)
+    if at == base or at + 2 > bytes.len(source)
+        return Ok(None)
+    let count = read_at16(source, at, order)
+    if at + 2 + count * 12 + 4 > bytes.len(source)
+        return Ok(None)
+    var found: ?Int = None
+    var failure: ?ExifFault = None
+    var i = 0
+    while i < count
+        let off = at + 2 + i * 12
+        if read_at16(source, off, order) == exiftag.EXIF_TAG_ORIENTATION
+            let t = read_at16(source, off + 2, order)
+            let n = read_at32(source, off + 4, order)
+            if t != 3
+                failure = Some(ExifWrongTypeForTag(exiftag.EXIF_TAG_ORIENTATION, t, 3))
+            elif n != 1
+                failure = Some(ExifCountMismatch(off, exiftag.EXIF_TAG_ORIENTATION, n, 1))
+            else
+                found = Some(off)
+        i = i + 1
+    match failure
+        Some(f) => Err(f)
+        None    => Ok(found)
+
+// The source with one range of bytes left out.
+//
+// The answer is built in one new buffer with two copies rather than by
+// joining two slices, which is one allocation instead of three.  A
+// `+` join here would also leak: see the filing named above
+// `jpeg_exif_range`.
+fn without_range(source: Bytes, r: ?(Int, Int)) -> Bytes
+    match r
+        None    => bytes.clone(source)
+        Some(p) =>
+            let start = p.0
+            let end = p.1
+            var out = bytes.zeros(bytes.len(source) - (end - start))
+            bytes.copy_into(out, 0, source, 0, start)
+            bytes.copy_into(out, start, source, end, bytes.len(source) - end)
+            out
+
+// The half-open range the source's `Exif` APP1 segment occupies, or
+// `None` when it has none.  The segment is found from the TIFF
+// structure's own offset, which is ten bytes past the marker that
+// introduces it.
+//
+// The range is found here and the bytes are joined in `without_range`,
+// because a `+` join written inside a match arm is leaked by the
+// 0.20.2 compiler whether or not the arm runs — a shape `novo.lint`
+// does not see and `novo test` reports as `the run leaked`, exit 23.
+// The filing is
+// `language/a-join-in-a-match-arm-is-leaked-even-when-the-arm-is-not-taken`.
+fn jpeg_exif_range(source: Bytes) -> ?(Int, Int)
+    match exifread.tiff_offset(source)
+        Some(at) =>
+            let marker = at - 10
+            if marker >= 2 and byte_or(source, marker, 0) == 0xFF and byte_or(source, marker + 1, 0) == 0xE1
+                let length = read_at16(source, marker + 2, ExifBigEndian)
+                let end = marker + 2 + length
+                if end <= bytes.len(source) and end > marker + 2
+                    Some((marker, end))
+                else
+                    // cov: skip — the walk that found this segment checked the same range
+                    None
+            else
+                None
+        None     => None
+
+fn jpeg_without_exif(source: Bytes) -> Bytes
+    without_range(source, jpeg_exif_range(source))
+
+// Whether a PNG chunk at this offset has this four-byte type.
+fn chunk_type_is(source: Bytes, off: Int, name: Str) -> Bool
+    off >= 0
+        and off + 4 <= bytes.len(source)
+        and bytes.to_str(bytes.slice(source, off, off + 4)) == name
+
+// The half-open range the source's `eXIf` chunk occupies, or `None`
+// when it has none.  The chunk begins eight bytes before the TIFF
+// structure, at its length field.
+fn png_exif_range(source: Bytes) -> ?(Int, Int)
+    match exifread.tiff_offset(source)
+        Some(at) =>
+            let start = at - 8
+            if start >= 8 and chunk_type_is(source, at - 4, "eXIf")
+                let length = read_at32(source, start, ExifBigEndian)
+                let end = start + 12 + length
+                if end <= bytes.len(source) and end > start
+                    Some((start, end))
+                else
+                    // cov: skip — the walk that found this chunk checked the same range
+                    None
+            else
+                None
+        None     => None
+
+fn png_without_exif(source: Bytes) -> Bytes
+    without_range(source, png_exif_range(source))
+
+// The `eXIf` chunk for a block: length, type, data and CRC, where the
+// CRC covers the type and the data.
+fn exif_chunk(block: Bytes) -> Bytes
+    let name = bytes.from_byte_list([0x65, 0x58, 0x49, 0x66])
+    let body = name + block
+    bytes.concat([
+        bytes.u32_be(bytes.len(block)),
+        body,
+        bytes.u32_be(codec.crc32(body))])
+
+// The JPEG the metadata writes: the segment goes directly after the
+// start-of-image marker, which is where every writer puts it.
+fn write_jpeg(source: Bytes, d: ExifData) -> Result<Bytes, ExifFault> []
+    let block = block_with_thumbnail(source, d)
+    if bytes.len(block) + 6 > EXIF_JPEG_APP1_LIMIT
+        Err(ExifSegmentTooLarge(bytes.len(block) + 6, EXIF_JPEG_APP1_LIMIT))
+    else
+        // The APP1 marker, then the length that counts itself and
+        // everything after it, then the six-byte identifier and the
+        // structure.  The marker is what a reader looks for, and a
+        // segment written without one is a file no reader can find the
+        // metadata in.
+        let marker = bytes.from_byte_list([0xFF, 0xE1])
+        let identifier = bytes.from_byte_list([0x45, 0x78, 0x69, 0x66, 0x00, 0x00])
+        let head = bytes.u16_be(bytes.len(block) + 8)
+        let rest = jpeg_without_exif(source)
+        let segment = bytes.concat([marker, head, identifier, block])
+        if bytes.len(rest) >= 2
+            let image_start = bytes.slice(rest, 0, 2)
+            let tail = bytes.slice(rest, 2, bytes.len(rest))
+            Ok(bytes.concat([image_start, segment, tail]))
+        else
+            Ok(segment)
+
+// The PNG the metadata writes: the chunk goes directly after IHDR,
+// which is where the third edition puts it.
+fn write_png(source: Bytes, d: ExifData) -> Result<Bytes, ExifFault> []
+    let block = block_with_thumbnail(source, d)
+    let chunk = exif_chunk(block)
+    let rest = png_without_exif(source)
+    let after_ihdr = 20 + first_chunk_length(rest)
+    if bytes.len(rest) >= 8 and after_ihdr >= 8 and after_ihdr <= bytes.len(rest)
+        let before = bytes.slice(rest, 0, after_ihdr)
+        let after = bytes.slice(rest, after_ihdr, bytes.len(rest))
+        Ok(bytes.concat([before, chunk, after]))
+    else
+        Ok(bytes.concat([rest, chunk]))
 
 // What a write would do, computed before anything is written.
 //
@@ -79,7 +847,14 @@ pub const EXIF_JPEG_APP1_LIMIT = 65533
 //         Err(e) => println(e.message())
 // ```
 pub fn plan(source: Bytes, d: ExifData, c: ExifContainer) -> Result<ExifWritePlan, ExifFault> []
-    todo("exif-nv.exifwrite.plan")
+    let l = layout_of(d)
+    Ok(ExifWritePlan {
+        block_bytes: l.total,
+        fits: fits_in(c, l.total),
+        has_maker_note: carries_maker_note(d),
+        maker_note_moves: maker_note_moved(source, d, c),
+        keeps_thumbnail: thumbnail_kept(source, d),
+        dropped: dropped_between(source, d) })
 
 // Whether a plan loses nothing: the MakerNote does not move, the
 // thumbnail is kept, nothing is dropped, and the block fits.
@@ -99,7 +874,8 @@ pub fn plan(source: Bytes, d: ExifData, c: ExifContainer) -> Result<ExifWritePla
 //         Err(e) => println(e.message())
 // ```
 pub fn is_lossless(p: ExifWritePlan) -> Bool []
-    todo("exif-nv.exifwrite.is_lossless")
+    let nothing_dropped = list.len(p.dropped) == 0
+    p.fits and not p.maker_note_moves and p.keeps_thumbnail and nothing_dropped
 
 // The container's bytes with this metadata in place of whatever was
 // there.
@@ -122,7 +898,10 @@ pub fn is_lossless(p: ExifWritePlan) -> Bool []
 //         Err(e)  => println(e.message())
 // ```
 pub fn write(source: Bytes, d: ExifData, c: ExifContainer) -> Result<Bytes, ExifFault> []
-    todo("exif-nv.exifwrite.write")
+    match c
+        ExifContainerJpeg => write_jpeg(source, d)
+        ExifContainerPng  => write_png(source, d)
+        _                 => Ok(block_with_thumbnail(source, d))
 
 // The same, with the container sniffed rather than named.
 //
@@ -137,7 +916,9 @@ pub fn write(source: Bytes, d: ExifData, c: ExifContainer) -> Result<Bytes, Exif
 //         Err(e)  => println(e.message())
 // ```
 pub fn write_sniffed(source: Bytes, d: ExifData) -> Result<Bytes, ExifFault> []
-    todo("exif-nv.exifwrite.write_sniffed")
+    match exifread.sniff_container(source)
+        Some(c) => write(source, d, c)
+        None    => Err(ExifUnknownContainer)
 
 // The container's bytes with all EXIF removed.
 //
@@ -158,7 +939,13 @@ pub fn write_sniffed(source: Bytes, d: ExifData) -> Result<Bytes, ExifFault> []
 //         Err(e)  => println(e.message())
 // ```
 pub fn strip(source: Bytes) -> Result<Bytes, ExifFault> []
-    todo("exif-nv.exifwrite.strip")
+    match exifread.sniff_container(source)
+        Some(c) =>
+            match c
+                ExifContainerJpeg => Ok(jpeg_without_exif(source))
+                ExifContainerPng  => Ok(png_without_exif(source))
+                ExifContainerTiff => Ok(bytes.zeros(0))
+        None    => Ok(bytes.clone(source))
 
 // The container's bytes with only the orientation changed.
 //
@@ -179,7 +966,17 @@ pub fn strip(source: Bytes) -> Result<Bytes, ExifFault> []
 //         Err(e)  => println(e.message())
 // ```
 pub fn set_orientation(source: Bytes, o: ExifOrientation) -> Result<Bytes, ExifFault> []
-    todo("exif-nv.exifwrite.set_orientation")
+    match exifread.tiff_offset(source)
+        None       => Err(ExifNoExif)
+        Some(base) =>
+            let order = order_of(source, base)!
+            let found = orientation_entry_at(source, base, order)!
+            match found
+                None     => Err(ExifNoExif)
+                Some(at) =>
+                    var out = bytes.clone(source)
+                    put16(var out, at + 8, exiforient.tag_value(o), order)
+                    Ok(out)
 
 // The TIFF structure on its own, with no container around it.
 //
@@ -198,7 +995,7 @@ pub fn set_orientation(source: Bytes, o: ExifOrientation) -> Result<Bytes, ExifF
 //         Err(e)  => println(e.message())
 // ```
 pub fn to_tiff_block(d: ExifData) -> Result<Bytes, ExifFault> []
-    todo("exif-nv.exifwrite.to_tiff_block")
+    Ok(build_block(d))
 
 // How many bytes the TIFF structure would occupy, without building it.
 //
@@ -213,4 +1010,5 @@ pub fn to_tiff_block(d: ExifData) -> Result<Bytes, ExifFault> []
 //     println("${exifwrite.block_size(exifdata.empty(ExifLittleEndian)) >= 8}")
 // ```
 pub fn block_size(d: ExifData) -> Int []
-    todo("exif-nv.exifwrite.block_size")
+    let l = layout_of(d)
+    l.total

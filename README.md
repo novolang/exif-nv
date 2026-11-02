@@ -11,12 +11,6 @@ crate [`kamadak-exif`](https://docs.rs/kamadak-exif) and the Python
 package [`piexif`](https://piexif.readthedocs.io/). This package reads
 EXIF out of a JPEG, a PNG or a TIFF and writes it back.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What EXIF is
 
 EXIF is a TIFF file with no image in it, carried inside another file. It
@@ -112,10 +106,13 @@ fn main() [io]
                                 None    => println("not a rational")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: exif-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The four suites
+under `tests/` are the specification the implementation was fitted to:
+each asserts the offsets, the length fields and the refusals of the
+structure it names. `tests/exif_nv_edge_tests.nv` goes past them: a
+hand-built TIFF written byte for byte in both byte orders, all twelve
+types parsed and written back, the container walks with their truncated
+tails, and every refusal arm.
 
 ## What the package contains
 
@@ -259,22 +256,6 @@ The suite is written against the specifications themselves.
   JPEG APP1 segment, which is what every offset is relative to.
 - The rational arithmetic is asserted on the fractions cameras actually
   write: `1/250`, `10/2000`, `37/1`.
-
-Today every one of those assertions reaches a `not implemented` panic.
-
-## Implementation status
-
-| Area | Status |
-| --- | --- |
-| TIFF types, byte orders, rationals | declared, not implemented |
-| The five directories and the tag table | declared, not implemented |
-| Orientation | declared, not implemented |
-| Reading from JPEG, PNG and TIFF | declared, not implemented |
-| Writing back, with a plan first | declared, not implemented |
-| Stripping | declared, not implemented |
-| MakerNote parsing | not declared |
-| HEIF and AVIF containers | not declared — a later release |
-| XMP and IPTC | not declared — other standards |
 
 ## Licence
 

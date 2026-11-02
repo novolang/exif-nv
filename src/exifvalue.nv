@@ -39,6 +39,92 @@
 // drops a trailing NUL and takes the rest as UTF-8, and a caller that
 // needs to know what it really was reads the bytes.
 
+use std.bytes
+use std.list
+use std.math
+use std.str
+use exiffault
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// The first element of an integer list, or `None` when it is empty.
+fn first_of(xs: [Int]) -> ?Int
+    if list.len(xs) > 0
+        Some(list.get(xs, 0))
+    else
+        None
+
+// An ASCII field's bytes with one trailing NUL dropped.
+fn ascii_body(data: Bytes) -> Str
+    let n = bytes.len(data)
+    match bytes.byte_at(data, n - 1)
+        Some(0) => bytes.to_str(bytes.slice(data, 0, n - 1))
+        _       => bytes.to_str(data)
+
+// A rational with the numerator's sign flipped.
+fn negate_ratio(r: ExifRational) -> ExifRational
+    ExifRational { numerator: 0 - r.numerator, denominator: r.denominator }
+
+// The denominator ceiling, clamped to what a rational field can store:
+// both halves are unsigned 32-bit integers, so a larger ceiling could
+// not be written back into the file anyway.
+fn storage_cap(max_denominator: Int) -> Int
+    if max_denominator < 1
+        1
+    elif max_denominator > 4294967295
+        4294967295
+    else
+        max_denominator
+
+// A decimal number clamped to what a rational field can store.
+fn bounded(x: Float) -> Float
+    if x > 4294967295.0
+        4294967295.0
+    else
+        x
+
+// The spelling infinity takes in a rational field, where no number is.
+// `to_float` refuses it by name rather than answering an infinity back.
+fn inf_ratio(x: Float) -> ExifRational
+    if x < 0.0
+        ExifRational { numerator: 0 - 1, denominator: 0 }
+    else
+        ExifRational { numerator: 1, denominator: 0 }
+
+// The continued-fraction convergents of a positive decimal number: the
+// short spelling of the number — 0.004 as 1/250 rather than
+// 4000/1000000 — with no denominator above `cap`.  It stops when the
+// approximation is exact to nine places, when the next denominator
+// would pass the ceiling, and when the next numerator would pass what
+// the file's 32-bit field holds.  The denominators grow at least as
+// fast as the Fibonacci numbers, so it always stops.
+fn convergent(x: Float, cap: Int) -> ExifRational
+    let ceiling = cap as Float
+    var h0 = 0.0
+    var k0 = 1.0
+    var h1 = 1.0
+    var k1 = 0.0
+    var left = x
+    var more = true
+    while more
+        let a = math.floor(left)
+        let nh = a * h1 + h0
+        let nk = a * k1 + k0
+        if nk > ceiling
+            more = false
+        else if nh > 4294967295.0
+            more = false
+        else
+            h0 = h1
+            k0 = k1
+            h1 = nh
+            k1 = nk
+            if left - a < 0.000000001
+                more = false
+            else
+                left = 1.0 / (left - a)
+    ExifRational { numerator: h1 as Int, denominator: k1 as Int }
+
 // A TIFF 6.0 type code.
 //
 // ```novo
@@ -165,7 +251,19 @@ pub enum ExifValue
 //     println("${exifvalue.type_code(ExifTypeAscii)}")   // 2
 // ```
 pub fn type_code(t: ExifType) -> Int []
-    todo("exif-nv.exifvalue.type_code")
+    match t
+        ExifTypeByte      => 1
+        ExifTypeAscii     => 2
+        ExifTypeShort     => 3
+        ExifTypeLong      => 4
+        ExifTypeRational  => 5
+        ExifTypeSbyte     => 6
+        ExifTypeUndefined => 7
+        ExifTypeSshort    => 8
+        ExifTypeSlong     => 9
+        ExifTypeSrational => 10
+        ExifTypeFloat     => 11
+        ExifTypeDouble    => 12
 
 // The type a code names, or `None` for a code outside 1 to 12.
 //
@@ -178,7 +276,20 @@ pub fn type_code(t: ExifType) -> Int []
 //         None    => println("not a TIFF type")
 // ```
 pub fn type_from_code(code: Int) -> ?ExifType []
-    todo("exif-nv.exifvalue.type_from_code")
+    match code
+        1  => Some(ExifTypeByte)
+        2  => Some(ExifTypeAscii)
+        3  => Some(ExifTypeShort)
+        4  => Some(ExifTypeLong)
+        5  => Some(ExifTypeRational)
+        6  => Some(ExifTypeSbyte)
+        7  => Some(ExifTypeUndefined)
+        8  => Some(ExifTypeSshort)
+        9  => Some(ExifTypeSlong)
+        10 => Some(ExifTypeSrational)
+        11 => Some(ExifTypeFloat)
+        12 => Some(ExifTypeDouble)
+        _  => None
 
 // How many bytes one element of this type takes: 1, 2, 4 or 8.
 //
@@ -194,7 +305,19 @@ pub fn type_from_code(code: Int) -> ?ExifType []
 //     println("${exifvalue.type_size(ExifTypeShort)}")      // 2
 // ```
 pub fn type_size(t: ExifType) -> Int []
-    todo("exif-nv.exifvalue.type_size")
+    match t
+        ExifTypeByte      => 1
+        ExifTypeAscii     => 1
+        ExifTypeShort     => 2
+        ExifTypeLong      => 4
+        ExifTypeRational  => 8
+        ExifTypeSbyte     => 1
+        ExifTypeUndefined => 1
+        ExifTypeSshort    => 2
+        ExifTypeSlong     => 4
+        ExifTypeSrational => 8
+        ExifTypeFloat     => 4
+        ExifTypeDouble    => 8
 
 // The type's name: `"BYTE"`, `"ASCII"`, `"SHORT"`, and the rest, in
 // TIFF 6.0's own spelling.
@@ -206,7 +329,19 @@ pub fn type_size(t: ExifType) -> Int []
 //     println(exifvalue.type_name(ExifTypeSrational))   // SRATIONAL
 // ```
 pub fn type_name(t: ExifType) -> Str []
-    todo("exif-nv.exifvalue.type_name")
+    match t
+        ExifTypeByte      => "BYTE"
+        ExifTypeAscii     => "ASCII"
+        ExifTypeShort     => "SHORT"
+        ExifTypeLong      => "LONG"
+        ExifTypeRational  => "RATIONAL"
+        ExifTypeSbyte     => "SBYTE"
+        ExifTypeUndefined => "UNDEFINED"
+        ExifTypeSshort    => "SSHORT"
+        ExifTypeSlong     => "SLONG"
+        ExifTypeSrational => "SRATIONAL"
+        ExifTypeFloat     => "FLOAT"
+        ExifTypeDouble    => "DOUBLE"
 
 // The two-byte mark a byte order writes: `"II"` or `"MM"`.
 //
@@ -217,7 +352,9 @@ pub fn type_name(t: ExifType) -> Str []
 //     println(exifvalue.byte_order_mark(ExifBigEndian))   // MM
 // ```
 pub fn byte_order_mark(o: ExifByteOrder) -> Str []
-    todo("exif-nv.exifvalue.byte_order_mark")
+    match o
+        ExifLittleEndian => "II"
+        ExifBigEndian    => "MM"
 
 // The byte order a mark names, or `ExifBadByteOrder`.
 //
@@ -230,7 +367,10 @@ pub fn byte_order_mark(o: ExifByteOrder) -> Str []
 //         Err(e) => println(e.message())
 // ```
 pub fn byte_order_from_mark(mark: Int) -> Result<ExifByteOrder, ExifFault> []
-    todo("exif-nv.exifvalue.byte_order_from_mark")
+    match mark
+        0x4949 => Ok(ExifLittleEndian)
+        0x4d4d => Ok(ExifBigEndian)
+        _      => Err(ExifBadByteOrder(0 - 1, mark))
 
 // The type a value is.
 //
@@ -241,7 +381,15 @@ pub fn byte_order_from_mark(mark: Int) -> Result<ExifByteOrder, ExifFault> []
 //     println(exifvalue.type_name(exifvalue.type_of(ExifShorts([72]))))   // SHORT
 // ```
 pub fn type_of(v: ExifValue) -> ExifType []
-    todo("exif-nv.exifvalue.type_of")
+    match v
+        ExifBytes(_)      => ExifTypeByte
+        ExifAscii(_)      => ExifTypeAscii
+        ExifShorts(_)     => ExifTypeShort
+        ExifLongs(_)      => ExifTypeLong
+        ExifRationals(_)  => ExifTypeRational
+        ExifSigneds(_)    => ExifTypeSlong
+        ExifSrationals(_) => ExifTypeSrational
+        ExifFloats(_)     => ExifTypeFloat
 
 // How many elements a value holds — the entry's count field.
 //
@@ -256,7 +404,15 @@ pub fn type_of(v: ExifValue) -> ExifType []
 //     println("${exifvalue.count_of(ExifShorts([72, 72]))}")   // 2
 // ```
 pub fn count_of(v: ExifValue) -> Int []
-    todo("exif-nv.exifvalue.count_of")
+    match v
+        ExifBytes(data)        => bytes.len(data)
+        ExifAscii(data)        => bytes.len(data)
+        ExifShorts(values)     => list.len(values)
+        ExifLongs(values)      => list.len(values)
+        ExifRationals(values)  => list.len(values)
+        ExifSigneds(values)    => list.len(values)
+        ExifSrationals(values) => list.len(values)
+        ExifFloats(values)     => list.len(values)
 
 // A rational, spelled `numerator/denominator`: `"1/250"`, `"56/10"`.
 //
@@ -272,7 +428,7 @@ pub fn count_of(v: ExifValue) -> Int []
 //     println(exifvalue.format_ratio(ExifRational { numerator: 10, denominator: 2000 }))
 // ```
 pub fn format_ratio(r: ExifRational) -> Str []
-    todo("exif-nv.exifvalue.format_ratio")
+    str.from_int(r.numerator) + "/" + str.from_int(r.denominator)
 
 // A rational as a floating point number, or `ExifZeroDenominator`.
 //
@@ -289,7 +445,10 @@ pub fn format_ratio(r: ExifRational) -> Str []
 //         Err(e) => println(e.message())
 // ```
 pub fn to_float(r: ExifRational) -> Result<Float, ExifFault> []
-    todo("exif-nv.exifvalue.to_float")
+    if r.denominator == 0
+        Err(ExifZeroDenominator(0 - 1, 0 - 1))
+    else
+        Ok(r.numerator as Float / r.denominator as Float)
 
 // A signed rational as a floating point number, or
 // `ExifZeroDenominator`.
@@ -303,7 +462,10 @@ pub fn to_float(r: ExifRational) -> Result<Float, ExifFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn srational_to_float(r: ExifSrational) -> Result<Float, ExifFault> []
-    todo("exif-nv.exifvalue.srational_to_float")
+    if r.denominator == 0
+        Err(ExifZeroDenominator(0 - 1, 0 - 1))
+    else
+        Ok(r.numerator as Float / r.denominator as Float)
 
 // The rational a decimal number is closest to, with a denominator no
 // larger than `max_denominator`.
@@ -322,7 +484,15 @@ pub fn srational_to_float(r: ExifSrational) -> Result<Float, ExifFault> []
 //     println(exifvalue.ratio_from_float(0.004, 1000))   // 1/250
 // ```
 pub fn ratio_from_float(value: Float, max_denominator: Int) -> ExifRational []
-    todo("exif-nv.exifvalue.ratio_from_float")
+    let cap = storage_cap(max_denominator)
+    if math.is_nan(value)
+        ExifRational { numerator: 0, denominator: 0 }
+    elif math.is_inf(value)
+        inf_ratio(value)
+    elif value < 0.0
+        negate_ratio(convergent(0.0 - bounded(value), cap))
+    else
+        convergent(bounded(value), cap)
 
 // An ASCII field's text: the bytes with one trailing NUL dropped,
 // taken as UTF-8.
@@ -341,7 +511,13 @@ pub fn ratio_from_float(value: Float, max_denominator: Int) -> ExifRational []
 //     println(exifvalue.ascii_text(ExifAscii(bytes.from_str("Canon\u{0}"))))   // Canon
 // ```
 pub fn ascii_text(v: ExifValue) -> Str []
-    todo("exif-nv.exifvalue.ascii_text")
+    match v
+        ExifAscii(data) => ascii_body(data)
+        _               =>
+            // The block form, not the inline one: the inline form of a
+            // `Never`-typed call is refused as a Unit arm
+            // (language/a-never-typed-call-as-an-inline-match-arm-body-is-refused).
+            core.panic.panic("exifvalue.ascii_text: not an ASCII value")
 
 // An ASCII value from text, with the trailing NUL added.
 //
@@ -352,7 +528,8 @@ pub fn ascii_text(v: ExifValue) -> Str []
 //     println("${exifvalue.count_of(exifvalue.ascii_value("Canon"))}")   // 6, the NUL included
 // ```
 pub fn ascii_value(text: Str) -> ExifValue []
-    todo("exif-nv.exifvalue.ascii_value")
+    let raw = bytes.concat([bytes.from_str(text), bytes.u8(0)])
+    ExifAscii(raw)
 
 // The first element of an integer-valued entry, or `None`.
 //
@@ -369,7 +546,11 @@ pub fn ascii_value(text: Str) -> ExifValue []
 //         None    => println("not an integer value")
 // ```
 pub fn first_int(v: ExifValue) -> ?Int []
-    todo("exif-nv.exifvalue.first_int")
+    match v
+        ExifShorts(values)  => first_of(values)
+        ExifLongs(values)   => first_of(values)
+        ExifSigneds(values) => first_of(values)
+        _                   => None
 
 // The first element of a rational-valued entry, or `None`.
 //
@@ -382,7 +563,12 @@ pub fn first_int(v: ExifValue) -> ?Int []
 //         None    => println("not a rational value")
 // ```
 pub fn first_ratio(v: ExifValue) -> ?ExifRational []
-    todo("exif-nv.exifvalue.first_ratio")
+    match v
+        ExifRationals(values) => if list.len(values) > 0
+            Some(list.get(values, 0))
+        else
+            None
+        _                     => None
 
 // How many bytes this value occupies in the file: `count * type_size`.
 //
@@ -397,7 +583,7 @@ pub fn first_ratio(v: ExifValue) -> ?ExifRational []
 //     println("${exifvalue.byte_length(ExifShorts([72, 72]))}")   // 4, so it fits inline
 // ```
 pub fn byte_length(v: ExifValue) -> Int []
-    todo("exif-nv.exifvalue.byte_length")
+    count_of(v) * type_size(type_of(v))
 
 // Whether a value fits the four bytes a directory entry holds inline.
 //
@@ -409,4 +595,4 @@ pub fn byte_length(v: ExifValue) -> Int []
 //     println("${exifvalue.fits_inline(ExifRationals([]))}")      // true — nothing fits
 // ```
 pub fn fits_inline(v: ExifValue) -> Bool []
-    todo("exif-nv.exifvalue.fits_inline")
+    byte_length(v) <= 4

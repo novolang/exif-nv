@@ -35,7 +35,522 @@
 // options carry the three ceilings that stop each, and their defaults
 // are well above anything a camera writes.
 
+use std.bytes
+use std.list
+use std.math
 use exifdata
+use exiffault
+use exiforient
+use exiftag
+use exifvalue
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// A byte at an offset, or `d` when the buffer is shorter than that.
+// `bytes.byte_at` already refuses to read past the end; this is the
+// one-line spelling of the default every read here wants.
+fn byte_or(source: Bytes, i: Int, d: Int) -> Int
+    bytes.byte_at(source, i) ?? d
+
+// Two bytes as an unsigned number, in the file's own byte order.
+fn read_u16(source: Bytes, off: Int, order: ExifByteOrder) -> Int
+    if order == ExifLittleEndian
+        bytes.u16_le_at(source, off) ?? 0
+    else
+        bytes.u16_be_at(source, off) ?? 0
+
+// Four bytes as an unsigned number.
+fn read_u32(source: Bytes, off: Int, order: ExifByteOrder) -> Int
+    if order == ExifLittleEndian
+        bytes.u32_le_at(source, off) ?? 0
+    else
+        bytes.u32_be_at(source, off) ?? 0
+
+// Eight bytes, as the signed Int whose bit pattern they are: an
+// unsigned 64-bit read puts the top bit in the sign, which is both
+// what a DOUBLE's sign bit is and what lets the bits be handed to
+// `bytes.u64_le` unchanged.
+fn read_u64(source: Bytes, off: Int, order: ExifByteOrder) -> Int
+    if order == ExifLittleEndian
+        bytes.u64_le_at(source, off) ?? 0
+    else
+        bytes.u64_be_at(source, off) ?? 0
+
+// A read of two bytes as a signed number: the readers answer the
+// unsigned pattern the file holds, and two's complement is the rest.
+fn signed16(n: Int) -> Int
+    if n >= 32768
+        n - 65536
+    else
+        n
+
+// A four-byte read as a signed number.
+fn signed32(n: Int) -> Int
+    if n >= 2147483648
+        n - 4294967296
+    else
+        n
+
+// A one-byte read as a signed number.
+fn signed8(n: Int) -> Int
+    if n >= 128
+        n - 256
+    else
+        n
+
+// The float those 32 bits are.
+fn float32_from_bits(raw: Int) -> Float
+    let sign = if (raw & 0x80000000) != 0
+        0.0 - 1.0
+    else
+        1.0
+    let exp = (raw >>> 23) & 0xFF
+    let frac = raw & 0x7FFFFF
+    match exp
+        0   => sign * (frac as Float * math.pow(2.0, 0.0 - 149.0))
+        255 =>
+            if frac == 0
+                sign * math.infinity()
+            else
+                math.nan()
+        _   => sign * (1.0 + frac as Float / 8388608.0) * math.pow(2.0, (exp - 127) as Float)
+
+// The double those 64 bits are.
+//
+// The subnormal branch stays above 2 to the -1022 on purpose: that is
+// the smallest power of two this host's `pow` represents, and a
+// division by it is exact where a division by 2 to the -1074 would
+// underflow to zero.
+fn double_from_bits(raw: Int) -> Float
+    let sign = if raw < 0
+        0.0 - 1.0
+    else
+        1.0
+    let exp = (raw >>> 52) & 0x7FF
+    let frac = raw & 0xFFFFFFFFFFFFF
+    match exp
+        0    => sign * (frac as Float / 4503599627370496.0 * math.pow(2.0, 0.0 - 1022.0))
+        2047 =>
+            if frac == 0
+                sign * math.infinity()
+            else
+                math.nan()
+        _    => sign * (1.0 + frac as Float / 4503599627370496.0) * math.pow(2.0, (exp - 1023) as Float)
+
+// The value one entry of this type and count holds, read from `at`
+// where its bytes begin.  The caller has already checked that `at`
+// plus the value's length lies inside the block, so a reader here
+// cannot come up short.
+fn at_value(source: Bytes, at: Int, order: ExifByteOrder, t: ExifType, count: Int) -> ExifValue
+    match t
+        ExifTypeAscii     => ExifAscii(bytes.slice(source, at, at + count))
+        ExifTypeShort     =>
+            var xs: [Int] = []
+            var i = 0
+            while i < count
+                list.push(xs, read_u16(source, at + i * 2, order))
+                i = i + 1
+            ExifShorts(xs)
+        ExifTypeLong      =>
+            var xs: [Int] = []
+            var i = 0
+            while i < count
+                list.push(xs, read_u32(source, at + i * 4, order))
+                i = i + 1
+            ExifLongs(xs)
+        ExifTypeRational  =>
+            var rs: [ExifRational] = []
+            var i = 0
+            while i < count
+                list.push(rs, ExifRational {
+                    numerator: read_u32(source, at + i * 8, order),
+                    denominator: read_u32(source, at + i * 8 + 4, order) })
+                i = i + 1
+            ExifRationals(rs)
+        ExifTypeSbyte     =>
+            var xs: [Int] = []
+            var i = 0
+            while i < count
+                list.push(xs, signed8(byte_or(source, at + i, 0)))
+                i = i + 1
+            ExifSigneds(xs)
+        ExifTypeSshort    =>
+            var xs: [Int] = []
+            var i = 0
+            while i < count
+                list.push(xs, signed16(read_u16(source, at + i * 2, order)))
+                i = i + 1
+            ExifSigneds(xs)
+        ExifTypeSlong     =>
+            var xs: [Int] = []
+            var i = 0
+            while i < count
+                list.push(xs, signed32(read_u32(source, at + i * 4, order)))
+                i = i + 1
+            ExifSigneds(xs)
+        ExifTypeSrational =>
+            var rs: [ExifSrational] = []
+            var i = 0
+            while i < count
+                list.push(rs, ExifSrational {
+                    numerator: signed32(read_u32(source, at + i * 8, order)),
+                    denominator: signed32(read_u32(source, at + i * 8 + 4, order)) })
+                i = i + 1
+            ExifSrationals(rs)
+        ExifTypeFloat     =>
+            var xs: [Float] = []
+            var i = 0
+            while i < count
+                list.push(xs, float32_from_bits(read_u32(source, at + i * 4, order)))
+                i = i + 1
+            ExifFloats(xs)
+        ExifTypeDouble    =>
+            var xs: [Float] = []
+            var i = 0
+            while i < count
+                list.push(xs, double_from_bits(read_u64(source, at + i * 8, order)))
+                i = i + 1
+            ExifFloats(xs)
+        _                 =>
+            // BYTE and UNDEFINED: the bytes as they stand.  A MakerNote
+            // is read this way and rewritten byte for byte, which is the
+            // only thing that keeps its internal offsets valid.
+            ExifBytes(bytes.slice(source, at, at + count))
+
+// Whether any rational in this value has a zero denominator — the one
+// defect a reader reports rather than answers as infinity.
+fn has_zero_denominator(v: ExifValue) -> Bool
+    match v
+        ExifRationals(rs)  => list.any(rs, r => r.denominator == 0)
+        ExifSrationals(rs) => list.any(rs, r => r.denominator == 0)
+        _                  => false
+
+// What the tag table says about one entry: the type and count
+// mismatches, which are findings and not refusals.  A tag the table
+// does not know gets none, because the table has nothing to disagree
+// with.
+fn table_findings(ifd: ExifIfd, tag: Int, type_code: Int, val_count: Int, off: Int) -> [ExifFault]
+    match exiftag.tag_at(ifd, tag)
+        Some(known) =>
+            var out: [ExifFault] = []
+            if exifvalue.type_code(known.expected_type) != type_code
+                list.push(out,
+                    ExifTypeMismatch(off, tag, type_code, exifvalue.type_code(known.expected_type)))
+            if known.expected_count != 0 - 1 and known.expected_count != val_count
+                list.push(out, ExifCountMismatch(off, tag, val_count, known.expected_count))
+            out
+        None        =>
+            []
+
+// The directory a pointer entry names, as the pair to walk next: a
+// tag that points at a sub-directory, and an offset that is not zero.
+fn pointer_pair(tag: Int, field: Int) -> ?(ExifIfd, Int)
+    if field == 0
+        None
+    else
+        match exiftag.ifd_behind_pointer(tag)
+            Some(sub) => Some((sub, field))
+            None      => None
+
+// Whether these bytes begin with the eight-byte PNG signature.
+fn has_png_signature(source: Bytes) -> Bool
+    bytes.byte_at(source, 0) == Some(0x89)
+        and bytes.byte_at(source, 1) == Some('P')
+        and bytes.byte_at(source, 2) == Some('N')
+        and bytes.byte_at(source, 3) == Some('G')
+        and bytes.byte_at(source, 4) == Some('\r')
+        and bytes.byte_at(source, 5) == Some('\n')
+        and bytes.byte_at(source, 6) == Some(0x1A)
+        and bytes.byte_at(source, 7) == Some('\n')
+
+// The six bytes `Exif\0\0`, and enough segment behind them to hold
+// them.
+fn has_exif_identifier(source: Bytes, from: Int, avail: Int) -> Bool
+    if avail < 6
+        false
+    else
+        bytes.byte_at(source, from) == Some('E')
+            and bytes.byte_at(source, from + 1) == Some('x')
+            and bytes.byte_at(source, from + 2) == Some('i')
+            and bytes.byte_at(source, from + 3) == Some('f')
+            and bytes.byte_at(source, from + 4) == Some(0)
+            and bytes.byte_at(source, from + 5) == Some(0)
+
+// The TIFF structure inside a JPEG's `Exif` APP1 segment, as a span
+// into the whole buffer, or `None` when no segment carries one.
+//
+// A JPEG is marker segments: two bytes of marker, and — for every
+// marker but the standalone ones — two bytes of length that count
+// themselves.  A truncated segment ends the walk rather than refusing
+// the file, because a caller that has already decoded a photograph
+// should not lose it to a tail.
+fn jpeg_tiff_span(source: Bytes) -> ?ExifSpan
+    let n = bytes.len(source)
+    var at = 2
+    var span: ?ExifSpan = None
+    var scanning = true
+    while scanning
+        if at + 4 > n
+            scanning = false
+        elif byte_or(source, at, 0) != 0xFF
+            scanning = false
+        else
+            let marker = byte_or(source, at + 1, 0)
+            match marker
+                0xd8 | 0x1 | 0xd0..=0xd7 =>
+                    at = at + 2
+                0xda                     =>
+                    scanning = false
+                _                        =>
+                    let length = read_u16(source, at + 2, ExifBigEndian)
+                    if length < 2 or at + 2 + length > n
+                        scanning = false
+                    elif marker == 0xE1 and has_exif_identifier(source, at + 4, length - 2)
+                        span = Some(ExifSpan { start: at + 10, length: length - 8 })
+                        scanning = false
+                    else
+                        at = at + 2 + length
+    span
+
+// Whether a PNG chunk at this offset has this four-byte type.
+fn chunk_is(source: Bytes, off: Int, name: Str) -> Bool
+    bytes.to_str(bytes.slice(source, off, off + 4)) == name
+
+// The TIFF structure inside a PNG's `eXIf` chunk, as a span into the
+// whole buffer, or `None` when there is no such chunk.
+//
+// A PNG chunk is four bytes of length that do NOT count the length
+// itself, four bytes of type, the data and four bytes of CRC.  The
+// `eXIf` chunk's data is the TIFF structure with no `Exif\0\0` in
+// front of it, which is the one way it differs from the JPEG segment.
+fn png_tiff_span(source: Bytes) -> ?ExifSpan
+    let n = bytes.len(source)
+    var at = 8
+    var span: ?ExifSpan = None
+    var scanning = true
+    while scanning
+        if at + 12 > n
+            scanning = false
+        else
+            let length = read_u32(source, at, ExifBigEndian)
+            if at + 12 + length > n
+                scanning = false
+            elif chunk_is(source, at + 4, "eXIf")
+                span = Some(ExifSpan { start: at + 8, length: length })
+                scanning = false
+            elif chunk_is(source, at + 4, "IEND")
+                scanning = false
+            else
+                at = at + 12 + length
+    span
+
+// Where the TIFF structure sits inside these bytes, or `None` when
+// the container carries none.  For a bare TIFF the structure starts at
+// byte zero and runs to the end of the file.
+fn block_in(source: Bytes, c: ExifContainer) -> ?ExifSpan
+    match c
+        ExifContainerJpeg => jpeg_tiff_span(source)
+        ExifContainerPng  => png_tiff_span(source)
+        _                 => Some(ExifSpan { start: 0, length: bytes.len(source) })
+
+// The orientation tag's value in the 0th IFD, or `None`.
+//
+// One directory and one entry, which is the whole of what
+// `read_orientation` promises: a thumbnail service reads this tag out
+// of every photograph on a disk and nothing else, and a full walk
+// allocates forty values to find it.
+fn orientation_tag_value(source: Bytes, base: Int, limit: Int) -> ?Int
+    var order = ExifLittleEndian
+    match (bytes.byte_at(source, base), bytes.byte_at(source, base + 1))
+        (Some(73), Some(73)) =>
+            order = ExifLittleEndian
+        (Some(77), Some(77)) =>
+            order = ExifBigEndian
+        _                    =>
+            return None
+    if read_u16(source, base + 2, order) != 42
+        return None
+    let at = read_u32(source, base + 4, order)
+    let count_off = base + at
+    if at == 0 or count_off + 2 > limit
+        return None
+    let count = read_u16(source, count_off, order)
+    if count_off + 2 + count * 12 + 4 > limit
+        return None
+    var found: ?Int = None
+    var i = 0
+    while i < count
+        let off = count_off + 2 + i * 12
+        if read_u16(source, off, order) == exiftag.EXIF_TAG_ORIENTATION
+            let code = read_u16(source, off + 2, order)
+            let n = read_u32(source, off + 4, order)
+            if code == 3 and n >= 1
+                found = Some(read_u16(source, off + 8, order))
+            elif code == 4 and n >= 1
+                found = Some(read_u32(source, off + 8, order))
+        i = i + 1
+    found
+
+// The orientation tag's value wherever the container keeps its TIFF
+// structure.
+fn orientation_in(source: Bytes) -> ?Int
+    match sniff_container(source)
+        Some(c) =>
+            match block_in(source, c)
+                Some(span) =>
+                    let base = span.start
+                    let limit = base + span.length
+                    orientation_tag_value(source, base, limit)
+                None       => None
+        None    => None
+
+// The TIFF structure from `base` to `limit` inside `source`, walked
+// and read, with everything that was wrong about it beside it.
+//
+// The walk is a work list of (directory, offset) pairs rather than a
+// chain, because three of the five directories — the Exif, GPS and
+// interoperability IFDs — are not on the chain at all: each hangs off
+// a pointer entry, and a reader that follows only the chain reads two
+// of the five.
+fn read_block(source: Bytes, base: Int, limit: Int,
+              o: ExifReadOptions) -> Result<(ExifData, [ExifFault]), ExifFault> []
+    let b0 = bytes.byte_at(source, base)
+    let b1 = bytes.byte_at(source, base + 1)
+    var order = ExifLittleEndian
+    match (b0, b1)
+        (Some(73), Some(73)) =>
+            order = ExifLittleEndian
+        (Some(77), Some(77)) =>
+            order = ExifBigEndian
+        _                    =>
+            return Err(ExifBadByteOrder(base, (b0 ?? 0 - 1) * 256 + (b1 ?? 0 - 1)))
+    let magic = read_u16(source, base + 2, order)
+    if magic != 42
+        return Err(ExifBadMagic(base + 2, magic))
+    var entries: [ExifEntry] = []
+    var findings: [ExifFault] = []
+    var seen: [Int] = []
+    var todo: [(ExifIfd, Int)] = []
+    let first = read_u32(source, base + 4, order)
+    if first != 0
+        list.push(todo, (ExifIfdPrimary, first))
+    var dirs = 0
+    var qi = 0
+    var budget = o.max_value_bytes
+    var thumb_at: ?Int = None
+    var thumb_len: ?Int = None
+    while qi < list.len(todo)
+        let item = list.get(todo, qi)
+        let ifd = item.0
+        let at = item.1
+        qi = qi + 1
+        if dirs >= o.max_directories
+            return Err(ExifTooManyDirectories(o.max_directories))
+        elif list.contains(seen, at)
+            return Err(ExifDirectoryLoop(base + at))
+        else
+            list.push(seen, at)
+            dirs = dirs + 1
+            let count_off = base + at
+            let avail = if limit > count_off
+                limit - count_off
+            else
+                0
+            if avail < 2
+                return Err(ExifDirectoryTruncated(count_off, 0, avail))
+            let count = read_u16(source, count_off, order)
+            if count > o.max_entries
+                // cov: skip — a count is two bytes and the ceiling is 65535, which is the largest one
+                return Err(ExifDirectoryTruncated(count_off, count, avail))
+            if 2 + count * 12 + 4 > avail
+                return Err(ExifDirectoryTruncated(count_off, count, avail))
+            var k = 0
+            while k < count
+                let entry_off = count_off + 2 + k * 12
+                k = k + 1
+                let tag = read_u16(source, entry_off, order)
+                let type_code = read_u16(source, entry_off + 2, order)
+                let val_count = read_u32(source, entry_off + 4, order)
+                let field = read_u32(source, entry_off + 8, order)
+                match pointer_pair(tag, field)
+                    Some(pair) =>
+                        list.push(todo, pair)
+                    None       =>
+                        match exifvalue.type_from_code(type_code)
+                            None    =>
+                                list.push(findings, ExifUnknownType(entry_off, tag, type_code))
+                            Some(t) =>
+                                let size = val_count * exifvalue.type_size(t)
+                                let vat = if size <= 4
+                                    entry_off + 8
+                                else
+                                    base + field
+                                if size > budget
+                                    // The crafted-count ceiling the options
+                                    // promise: a count field is four bytes, so
+                                    // one entry can claim four thousand
+                                    // million.  The default budget makes this
+                                    // unreachable for a real file.
+                                    return Err(ExifDirectoryTruncated(count_off, count, budget))
+                                elif vat + size > limit
+                                    list.push(findings, ExifOffsetOutOfRange(entry_off, tag, vat, limit))
+                                else
+                                    budget = budget - size
+                                    let v = at_value(source, vat, order, t, val_count)
+                                    for f in table_findings(ifd, tag, type_code, val_count, entry_off)
+                                        list.push(findings, f)
+                                    if has_zero_denominator(v)
+                                        list.push(findings, ExifZeroDenominator(entry_off, tag))
+                                    if ifd == ExifIfdThumbnail and tag == exiftag.EXIF_TAG_THUMBNAIL_OFFSET
+                                        thumb_at = exifvalue.first_int(v)
+                                    if ifd == ExifIfdThumbnail and tag == exiftag.EXIF_TAG_THUMBNAIL_LENGTH
+                                        thumb_len = exifvalue.first_int(v)
+                                    list.push(entries, ExifEntry {
+                                        ifd: ifd,
+                                        tag: tag,
+                                        declared_type: t,
+                                        value: v,
+                                        offset: entry_off })
+            let next = read_u32(source, count_off + 2 + count * 12, order)
+            if next != 0
+                var nxt = ifd
+                if ifd == ExifIfdPrimary
+                    nxt = ExifIfdThumbnail
+                list.push(todo, (nxt, next))
+    var thumbnail: ?ExifSpan = None
+    match (thumb_at, thumb_len)
+        (Some(at), Some(len)) if at >= 0 and len > 0 and base + at + len <= limit =>
+            thumbnail = Some(ExifSpan { start: base + at, length: len })
+        _                                                                         => ()
+    Ok((
+        ExifData {
+            byte_order: order,
+            entries: entries,
+            thumbnail: thumbnail,
+            tiff_span: ExifSpan { start: base, length: limit - base } },
+        findings))
+
+// The report for a container whose name is already known.
+fn report_in(source: Bytes, c: ExifContainer,
+             o: ExifReadOptions) -> Result<?ExifReport, ExifFault> []
+    match block_in(source, c)
+        None       => Ok(None)
+        Some(span) =>
+            let base = span.start
+            let limit = base + span.length
+            let parts = read_block(source, base, limit, o)!
+            let data = parts.0
+            let faults = parts.1
+            Ok(Some(ExifReport { data: data, findings: faults }))
+
+// The data alone, for the callers that do not ask what was wrong.
+fn data_of(source: Bytes, c: ExifContainer, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
+    let parts = report_in(source, c, o)!
+    match parts
+        Some(rep) =>
+            let d = rep.data
+            Ok(Some(d))
+        None      => Ok(None)
 
 // Which container the EXIF is in.
 //
@@ -81,7 +596,10 @@ pub struct ExifReadOptions
 //     println("${exifread.default_options().max_directories}")   // 16
 // ```
 pub fn default_options() -> ExifReadOptions []
-    todo("exif-nv.exifread.default_options")
+    ExifReadOptions {
+        max_directories: 16,
+        max_entries: 65535,
+        max_value_bytes: 16777216 }
 
 // The same options with a different directory ceiling.
 //
@@ -92,7 +610,10 @@ pub fn default_options() -> ExifReadOptions []
 //     println("${exifread.with_max_directories(exifread.default_options(), 4).max_directories}")
 // ```
 pub fn with_max_directories(o: ExifReadOptions, n: Int) -> ExifReadOptions []
-    todo("exif-nv.exifread.with_max_directories")
+    ExifReadOptions {
+        max_directories: n,
+        max_entries: o.max_entries,
+        max_value_bytes: o.max_value_bytes }
 
 // The same options with a different ceiling on value bytes.
 //
@@ -103,7 +624,10 @@ pub fn with_max_directories(o: ExifReadOptions, n: Int) -> ExifReadOptions []
 //     println("${exifread.with_max_value_bytes(exifread.default_options(), 1024).max_value_bytes}")
 // ```
 pub fn with_max_value_bytes(o: ExifReadOptions, n: Int) -> ExifReadOptions []
-    todo("exif-nv.exifread.with_max_value_bytes")
+    ExifReadOptions {
+        max_directories: o.max_directories,
+        max_entries: o.max_entries,
+        max_value_bytes: n }
 
 // The container's name: `"jpeg"`, `"png"`, `"tiff"`.
 //
@@ -114,7 +638,10 @@ pub fn with_max_value_bytes(o: ExifReadOptions, n: Int) -> ExifReadOptions []
 //     println(exifread.container_name(ExifContainerTiff))   // tiff
 // ```
 pub fn container_name(c: ExifContainer) -> Str []
-    todo("exif-nv.exifread.container_name")
+    match c
+        ExifContainerJpeg => "jpeg"
+        ExifContainerPng  => "png"
+        ExifContainerTiff => "tiff"
 
 // The container these bytes are, or `None`.
 //
@@ -134,7 +661,13 @@ pub fn container_name(c: ExifContainer) -> Str []
 //         None    => println("not a container this package reads")
 // ```
 pub fn sniff_container(source: Bytes) -> ?ExifContainer []
-    todo("exif-nv.exifread.sniff_container")
+    match (bytes.byte_at(source, 0), bytes.byte_at(source, 1),
+           bytes.byte_at(source, 2), bytes.byte_at(source, 3))
+        (Some(0xff), Some(0xd8), _, _)          => Some(ExifContainerJpeg)
+        _ if has_png_signature(source)          => Some(ExifContainerPng)
+        (Some(73), Some(73), Some(42), Some(0)) => Some(ExifContainerTiff)
+        (Some(77), Some(77), Some(0), Some(42)) => Some(ExifContainerTiff)
+        _                                       => None
 
 // The EXIF in these bytes, whatever the container, or `None` when
 // there is none.
@@ -156,7 +689,9 @@ pub fn sniff_container(source: Bytes) -> ?ExifContainer []
 //                 None    => println("no metadata")
 // ```
 pub fn read(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
-    todo("exif-nv.exifread.read")
+    match sniff_container(source)
+        Some(c) => data_of(source, c, o)
+        None    => Err(ExifUnknownContainer)
 
 // The EXIF, and every non-fatal finding about it.
 //
@@ -179,7 +714,9 @@ pub fn read(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> [
 //                 None      => println("no metadata")
 // ```
 pub fn read_report(source: Bytes, o: ExifReadOptions) -> Result<?ExifReport, ExifFault> []
-    todo("exif-nv.exifread.read_report")
+    match sniff_container(source)
+        Some(c) => report_in(source, c, o)
+        None    => Err(ExifUnknownContainer)
 
 // The EXIF in a JPEG's APP1 segment, or `None`.
 //
@@ -198,7 +735,9 @@ pub fn read_report(source: Bytes, o: ExifReadOptions) -> Result<?ExifReport, Exi
 //         Err(e) => println(e.message())
 // ```
 pub fn read_jpeg(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
-    todo("exif-nv.exifread.read_jpeg")
+    match sniff_container(source)
+        Some(ExifContainerJpeg) => data_of(source, ExifContainerJpeg, o)
+        _                       => Err(ExifUnknownContainer)
 
 // The EXIF in a PNG's `eXIf` chunk, or `None`.
 //
@@ -216,7 +755,9 @@ pub fn read_jpeg(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFau
 //         Err(e) => println(e.message())
 // ```
 pub fn read_png(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
-    todo("exif-nv.exifread.read_png")
+    match sniff_container(source)
+        Some(ExifContainerPng) => data_of(source, ExifContainerPng, o)
+        _                      => Err(ExifUnknownContainer)
 
 // The EXIF in a bare TIFF: the file itself.
 //
@@ -231,7 +772,11 @@ pub fn read_png(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFaul
 //         Err(e) => println(e.message())
 // ```
 pub fn read_tiff(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFault> []
-    todo("exif-nv.exifread.read_tiff")
+    // No sniff: the header is parsed at byte zero and refused by name,
+    // which is what tells a caller that handed a TSV to `read_tiff`
+    // that the byte-order mark was the problem rather than that the
+    // file was not a container.
+    data_of(source, ExifContainerTiff, o)
 
 // Where the TIFF structure begins inside a container, or `None`.
 //
@@ -252,7 +797,14 @@ pub fn read_tiff(source: Bytes, o: ExifReadOptions) -> Result<?ExifData, ExifFau
 //         None    => println("no EXIF here")
 // ```
 pub fn tiff_offset(source: Bytes) -> ?Int []
-    todo("exif-nv.exifread.tiff_offset")
+    match sniff_container(source)
+        Some(c) =>
+            match block_in(source, c)
+                Some(span) =>
+                    let start = span.start
+                    Some(start)
+                None       => None
+        None    => None
 
 // Only the orientation, without reading the rest.
 //
@@ -274,7 +826,9 @@ pub fn tiff_offset(source: Bytes) -> ?Int []
 //     println(exiforient.orientation_name(exifread.read_orientation(bytes.zeros(64))))
 // ```
 pub fn read_orientation(source: Bytes) -> ExifOrientation []
-    todo("exif-nv.exifread.read_orientation")
+    match orientation_in(source)
+        Some(v) => exiforient.from_tag_value(v)
+        None    => ExifUpright
 
 // Whether these bytes carry any EXIF at all.
 //
@@ -289,4 +843,9 @@ pub fn read_orientation(source: Bytes) -> ExifOrientation []
 //     println("${exifread.has_exif(bytes.zeros(64))}")   // false
 // ```
 pub fn has_exif(source: Bytes) -> Bool []
-    todo("exif-nv.exifread.has_exif")
+    // The block's existence is the whole question, so this is the
+    // offset and nothing else: no directory is walked and no value is
+    // allocated.
+    match tiff_offset(source)
+        Some(_) => true
+        None    => false

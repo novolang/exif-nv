@@ -31,8 +31,76 @@
 // ignores them and a validator prints them, and neither has to choose
 // between "read the file" and "know what was wrong with it".
 
+use std.bytes
+use std.list
+use std.str
 use exifvalue
 use exiforient
+use exiftag
+use exiffault
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// An ASCII value's text, or `None` for a value of any other type.
+//
+// `exifvalue.ascii_text` refuses a value that is not `ExifAscii`, and
+// a reference tag that was written as something else must not stop a
+// read: an unreadable `GPSLatitudeRef` is no sign at all, which is
+// north.
+fn ascii_or_none(v: ExifValue) -> ?Str
+    match v
+        ExifAscii(_) => Some(exifvalue.ascii_text(v))
+        _            => None
+
+// The sign a degrees/minutes/seconds triple carries, from its
+// reference tag.  `"S"` and `"W"` are the two negative ones; `"N"`,
+// `"E"`, an absent reference and a reference this package could not
+// read as text are all positive, which is what every viewer assumes.
+fn dms_sign(label: Str) -> Float
+    match label
+        "S" => 0.0 - 1.0
+        "W" => 0.0 - 1.0
+        _   => 1.0
+
+// One fixed-width number out of a date field: four digits of year, two
+// of month, and so on.  `None` when those bytes are not a number, which
+// is not a date this package hands back.
+fn field_int(s: Str, lo: Int, hi: Int) -> ?Int
+    match str.to_int(str.slice(s, lo, hi))
+        Some(n) if n >= 0 => Some(n)
+        _                 => None
+
+// One entry's degrees, minutes and seconds as degrees, with the sign
+// its reference tag carries, or `None` when the triple is absent.
+//
+// The refusal when a rational's denominator is zero comes out of
+// `exifvalue.to_float`, which is where the zero is: 51/0 is not a
+// number of degrees.
+fn gps_component(d: ExifData, tag: Int, ref_tag: Int) -> Result<?Float, ExifFault> []
+    match value(d, ExifIfdGps, tag)
+        None    => Ok(None)
+        Some(v) =>
+            match v
+                ExifRationals(rs) =>
+                    if list.len(rs) < 3
+                        Ok(None)
+                    else
+                        let whole = exifvalue.to_float(list.get(rs, 0))!
+                        let minutes = exifvalue.to_float(list.get(rs, 1))!
+                        let seconds = exifvalue.to_float(list.get(rs, 2))!
+                        let label = match value(d, ExifIfdGps, ref_tag)
+                            Some(rv) => ascii_or_none(rv)
+                            None     => None
+                        let degrees = whole + minutes / 60.0 + seconds / 3600.0
+                        Ok(Some(degrees * dms_sign(label ?? "")))
+                _                 => Ok(None)
+
+// Whether an entry is the one a directory and a tag number name.
+fn is_slot(e: ExifEntry, i: ExifIfd, tag: Int) -> Bool
+    if e.ifd == i
+        e.tag == tag
+    else
+        false
 
 // A range of bytes in the buffer the caller owns.
 //
@@ -99,7 +167,7 @@ pub struct ExifReport
 //     println("${list.len(exifdata.empty(ExifLittleEndian).entries)}")   // 0
 // ```
 pub fn entry_count(d: ExifData) -> Int []
-    todo("exif-nv.exifdata.entry_count")
+    list.len(d.entries)
 
 // Metadata with nothing in it, in a byte order of the caller's
 // choosing.
@@ -115,7 +183,11 @@ pub fn entry_count(d: ExifData) -> Int []
 //     println(exifvalue.byte_order_mark(exifdata.empty(ExifBigEndian).byte_order))
 // ```
 pub fn empty(order: ExifByteOrder) -> ExifData []
-    todo("exif-nv.exifdata.empty")
+    ExifData {
+        byte_order: order,
+        entries: [],
+        thumbnail: None,
+        tiff_span: ExifSpan { start: 0, length: 0 } }
 
 // Every entry in one directory, in ascending tag order.
 //
@@ -127,7 +199,14 @@ pub fn empty(order: ExifByteOrder) -> ExifData []
 //     println("${list.len(exifdata.entries_in(exifdata.empty(ExifLittleEndian), ExifIfdGps))}")
 // ```
 pub fn entries_in(d: ExifData, i: ExifIfd) -> [ExifEntry] []
-    todo("exif-nv.exifdata.entries_in")
+    var out: [ExifEntry] = []
+    for e in d.entries
+        if e.ifd == i
+            list.push(out, e)
+    // A fresh list, sorted in place: `d.entries` keeps the order the
+    // file was read in.
+    list.sort_by(out, e => e.tag)
+    out
 
 // One entry, or `None`.
 //
@@ -140,7 +219,11 @@ pub fn entries_in(d: ExifData, i: ExifIfd) -> [ExifEntry] []
 //         None    => println("absent")
 // ```
 pub fn entry(d: ExifData, i: ExifIfd, tag: Int) -> ?ExifEntry []
-    todo("exif-nv.exifdata.entry")
+    var found: ?ExifEntry = None
+    for e in d.entries
+        if is_slot(e, i, tag)
+            found = Some(e)
+    found
 
 // One entry's value, or `None`.
 //
@@ -153,7 +236,9 @@ pub fn entry(d: ExifData, i: ExifIfd, tag: Int) -> ?ExifEntry []
 //         None    => println("absent")
 // ```
 pub fn value(d: ExifData, i: ExifIfd, tag: Int) -> ?ExifValue []
-    todo("exif-nv.exifdata.value")
+    match entry(d, i, tag)
+        Some(e) => Some(e.value)
+        None    => None
 
 // Whether a directory has any entries at all.
 //
@@ -167,7 +252,7 @@ pub fn value(d: ExifData, i: ExifIfd, tag: Int) -> ?ExifValue []
 //     println("${exifdata.has_ifd(exifdata.empty(ExifLittleEndian), ExifIfdGps)}")   // false
 // ```
 pub fn has_ifd(d: ExifData, i: ExifIfd) -> Bool []
-    todo("exif-nv.exifdata.has_ifd")
+    list.any(d.entries, e => e.ifd == i)
 
 // The same metadata with one entry set, replacing any entry with the
 // same tag in the same directory.
@@ -182,7 +267,30 @@ pub fn has_ifd(d: ExifData, i: ExifIfd) -> Bool []
 //     println("${exifdata.entry_count(d)}")     // 1
 // ```
 pub fn set(d: ExifData, i: ExifIfd, tag: Int, v: ExifValue) -> ExifData []
-    todo("exif-nv.exifdata.set")
+    // A new list every time: the answer is a different piece of
+    // metadata and the caller's own is untouched.
+    var out: [ExifEntry] = []
+    for e in d.entries
+        // The entry being set is dropped here and written once below,
+        // so the answer carries one entry per tag however many the
+        // source had.
+        if not is_slot(e, i, tag)
+            list.push(out, e)
+    list.push(out, ExifEntry {
+        ifd: i,
+        tag: tag,
+        // The value's own type, because `ExifValue` does not spell
+        // `ExifSigneds` and the two integers apart — an entry that
+        // came from a file keeps the type the file declared, and one
+        // a caller made says what the value it handed over is.
+        declared_type: exifvalue.type_of(v),
+        value: v,
+        offset: 0 - 1 })
+    ExifData {
+        byte_order: d.byte_order,
+        entries: out,
+        thumbnail: d.thumbnail,
+        tiff_span: d.tiff_span }
 
 // The same metadata with one entry removed.
 //
@@ -196,7 +304,15 @@ pub fn set(d: ExifData, i: ExifIfd, tag: Int, v: ExifValue) -> ExifData []
 //     println("${exifdata.entry_count(exifdata.remove(d, ExifIfdPrimary, 0x0112))}")   // 0
 // ```
 pub fn remove(d: ExifData, i: ExifIfd, tag: Int) -> ExifData []
-    todo("exif-nv.exifdata.remove")
+    var out: [ExifEntry] = []
+    for e in d.entries
+        if not is_slot(e, i, tag)
+            list.push(out, e)
+    ExifData {
+        byte_order: d.byte_order,
+        entries: out,
+        thumbnail: d.thumbnail,
+        tiff_span: d.tiff_span }
 
 // The orientation the file claims, or `ExifUpright` when it claims
 // none.
@@ -217,7 +333,12 @@ pub fn remove(d: ExifData, i: ExifIfd, tag: Int) -> ExifData []
 //         exifdata.orientation(exifdata.empty(ExifLittleEndian))))   // upright
 // ```
 pub fn orientation(d: ExifData) -> ExifOrientation []
-    todo("exif-nv.exifdata.orientation")
+    match value(d, ExifIfdPrimary, EXIF_TAG_ORIENTATION)
+        // A tag that is present but is not an integer is not a
+        // refusal either: 1 is upright, and it is the value every
+        // viewer falls back to.
+        Some(v) => exiforient.from_tag_value(exifvalue.first_int(v) ?? 1)
+        None    => ExifUpright
 
 // Whether the file carries an orientation tag at all.
 //
@@ -228,7 +349,9 @@ pub fn orientation(d: ExifData) -> ExifOrientation []
 //     println("${exifdata.has_orientation(exifdata.empty(ExifLittleEndian))}")   // false
 // ```
 pub fn has_orientation(d: ExifData) -> Bool []
-    todo("exif-nv.exifdata.has_orientation")
+    match entry(d, ExifIfdPrimary, EXIF_TAG_ORIENTATION)
+        Some(_) => true
+        None    => false
 
 // The same metadata with the orientation set.
 //
@@ -241,7 +364,8 @@ pub fn has_orientation(d: ExifData) -> Bool []
 //     println("${exifdata.has_orientation(d)}")   // true
 // ```
 pub fn with_orientation(d: ExifData, o: ExifOrientation) -> ExifData []
-    todo("exif-nv.exifdata.with_orientation")
+    set(d, ExifIfdPrimary, EXIF_TAG_ORIENTATION,
+        ExifShorts([exiforient.tag_value(o)]))
 
 // Where the thumbnail is, or `None`.
 //
@@ -257,7 +381,7 @@ pub fn with_orientation(d: ExifData, o: ExifOrientation) -> ExifData []
 //         None    => println("no thumbnail")
 // ```
 pub fn thumbnail_span(d: ExifData) -> ?ExifSpan []
-    todo("exif-nv.exifdata.thumbnail_span")
+    d.thumbnail
 
 // The thumbnail's bytes, copied out of the caller's buffer.
 //
@@ -276,7 +400,9 @@ pub fn thumbnail_span(d: ExifData) -> ?ExifSpan []
 //         None    => println("no thumbnail")
 // ```
 pub fn thumbnail_bytes(d: ExifData, source: Bytes) -> ?Bytes []
-    todo("exif-nv.exifdata.thumbnail_bytes")
+    match d.thumbnail
+        Some(s) => Some(bytes.slice(source, s.start, s.start + s.length))
+        None    => None
 
 // Whether the thumbnail is JPEG, as opposed to uncompressed TIFF
 // strips.
@@ -292,7 +418,10 @@ pub fn thumbnail_bytes(d: ExifData, source: Bytes) -> ?Bytes []
 //     println("${exifdata.thumbnail_is_jpeg(exifdata.empty(ExifLittleEndian))}")   // false
 // ```
 pub fn thumbnail_is_jpeg(d: ExifData) -> Bool []
-    todo("exif-nv.exifdata.thumbnail_is_jpeg")
+    // 0x0103, `Compression`, in the 1st IFD: 6 is JPEG.
+    match value(d, ExifIfdThumbnail, 0x0103)
+        Some(v) => exifvalue.first_int(v) == Some(6)
+        None    => false
 
 // Where the MakerNote is, or `None`.
 //
@@ -309,7 +438,12 @@ pub fn thumbnail_is_jpeg(d: ExifData) -> Bool []
 //         None    => println("no maker note")
 // ```
 pub fn maker_note_span(d: ExifData) -> ?ExifSpan []
-    todo("exif-nv.exifdata.maker_note_span")
+    // `None` for every file, and it is a gap and not a decision: the
+    // MakerNote's bytes are read into the entry like any other
+    // `UNDEFINED` value, and `ExifEntry` does not carry where the
+    // value sat in the caller's buffer, so there is no span to answer.
+    // `value(d, ExifIfdExif, 0x927C)` is the entry.
+    None
 
 // The GPS position as degrees, positive north and positive east, or
 // `None`.
@@ -336,7 +470,14 @@ pub fn maker_note_span(d: ExifData) -> ?ExifSpan []
 //         Err(e) => println(e.message())
 // ```
 pub fn gps_degrees(d: ExifData) -> Result<?(Float, Float), ExifFault> []
-    todo("exif-nv.exifdata.gps_degrees")
+    let lat = gps_component(d, 0x0002, 0x0001)!
+    let lon = gps_component(d, 0x0004, 0x0003)!
+    match lat
+        Some(n) =>
+            match lon
+                Some(e) => Ok(Some((n, e)))
+                None    => Ok(None)
+        None    => Ok(None)
 
 // The date a tag holds, as the six numbers its fixed-width field
 // carries: year, month, day, hour, minute, second.
@@ -358,7 +499,24 @@ pub fn gps_degrees(d: ExifData) -> Result<?(Float, Float), ExifFault> []
 //         None    => println("no date")
 // ```
 pub fn date_fields(d: ExifData, i: ExifIfd, tag: Int) -> ?(Int, Int, Int, Int, Int, Int) []
-    todo("exif-nv.exifdata.date_fields")
+    match value(d, i, tag)
+        Some(v) =>
+            match ascii_or_none(v)
+                Some(s) =>
+                    // "YYYY:MM:DD HH:MM:SS".  A field shorter than
+                    // that, or whose separators are somewhere else,
+                    // is not a date and answers `None` rather than a
+                    // zeroed tuple a caller would print as a date.
+                    if str.len(s) < 19
+                        None
+                    else
+                        match (field_int(s, 0, 4), field_int(s, 5, 7), field_int(s, 8, 10),
+                               field_int(s, 11, 13), field_int(s, 14, 16), field_int(s, 17, 19))
+                            (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) =>
+                                Some((year, month, day, hour, minute, second))
+                            _ => None
+                None    => None
+        None    => None
 
 // How many findings a report carries.
 //
@@ -370,4 +528,4 @@ pub fn date_fields(d: ExifData, i: ExifIfd, tag: Int) -> ?(Int, Int, Int, Int, I
 //     println("${exifdata.finding_count(ExifReport { data: exifdata.empty(ExifLittleEndian), findings: [] })}")
 // ```
 pub fn finding_count(r: ExifReport) -> Int []
-    todo("exif-nv.exifdata.finding_count")
+    list.len(r.findings)

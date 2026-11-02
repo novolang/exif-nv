@@ -2,9 +2,6 @@
 // writing it back, against EXIF 2.32 sections 4.5 and 4.7, TIFF 6.0
 // section 2, and the PNG third edition's `eXIf` chunk.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: exif-nv.<module>.<fn>`.
-
 use std.test
 use std.list
 use std.bytes

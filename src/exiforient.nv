@@ -27,6 +27,37 @@
 // needs before it has decoded anything, because a 4000-by-3000 file
 // with `ExifRotate90` is a 3000-by-4000 picture.
 
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// The representative rotation angle, folded back into 0 to 359.  `%`
+// truncates towards zero, so a difference of -90 degrees has to be
+// carried round rather than left negative.
+fn norm360(deg: Int) -> Int
+    let r = deg % 360
+    if r < 0
+        r + 360
+    else
+        r
+
+// The orientation whose mirroring is `m` and whose rotation is `deg`.
+//
+// `mirrors` and `rotation_degrees` are the two halves of every one of
+// the eight, so this is the group's inverse map: given a pair, the one
+// orientation that has it.
+fn orientation_of(m: Bool, deg: Int) -> ExifOrientation
+    if m
+        match deg
+            0   => ExifMirrorH
+            90  => ExifMirrorHRotate90
+            180 => ExifMirrorV
+            _   => ExifMirrorHRotate270
+    else
+        match deg
+            0   => ExifUpright
+            90  => ExifRotate90
+            180 => ExifRotate180
+            _   => ExifRotate270
+
 // The eight orientations tag 0x0112 can carry.
 //
 // Named for what has to be DONE rather than for the tag's number,
@@ -72,7 +103,15 @@ pub enum ExifOrientation
 //     println(exiforient.orientation_name(ExifMirrorHRotate270))
 // ```
 pub fn orientation_name(o: ExifOrientation) -> Str []
-    todo("exif-nv.exiforient.orientation_name")
+    match o
+        ExifUpright          => "upright"
+        ExifMirrorH          => "mirror-h"
+        ExifRotate180        => "rotate-180"
+        ExifMirrorV          => "mirror-v"
+        ExifMirrorHRotate90  => "mirror-h-rotate-90"
+        ExifRotate90         => "rotate-90"
+        ExifMirrorHRotate270 => "mirror-h-rotate-270"
+        ExifRotate270        => "rotate-270"
 
 // The tag value an orientation is: 1 to 8.
 //
@@ -83,7 +122,15 @@ pub fn orientation_name(o: ExifOrientation) -> Str []
 //     println("${exiforient.tag_value(ExifRotate90)}")   // 6
 // ```
 pub fn tag_value(o: ExifOrientation) -> Int []
-    todo("exif-nv.exiforient.tag_value")
+    match o
+        ExifUpright          => 1
+        ExifMirrorH          => 2
+        ExifRotate180        => 3
+        ExifMirrorV          => 4
+        ExifMirrorHRotate90  => 5
+        ExifRotate90         => 6
+        ExifMirrorHRotate270 => 7
+        ExifRotate270        => 8
 
 // The orientation a tag value names, or `ExifUpright` for anything
 // outside 1 to 8.
@@ -99,7 +146,16 @@ pub fn tag_value(o: ExifOrientation) -> Int []
 //     println(exiforient.orientation_name(exiforient.from_tag_value(99)))   // upright
 // ```
 pub fn from_tag_value(v: Int) -> ExifOrientation []
-    todo("exif-nv.exiforient.from_tag_value")
+    match v
+        1 => ExifUpright
+        2 => ExifMirrorH
+        3 => ExifRotate180
+        4 => ExifMirrorV
+        5 => ExifMirrorHRotate90
+        6 => ExifRotate90
+        7 => ExifMirrorHRotate270
+        8 => ExifRotate270
+        _ => ExifUpright
 
 // Whether restoring this orientation exchanges width and height.
 //
@@ -117,7 +173,15 @@ pub fn from_tag_value(v: Int) -> ExifOrientation []
 //     println("${exiforient.swaps_dimensions(ExifRotate180)}")   // false
 // ```
 pub fn swaps_dimensions(o: ExifOrientation) -> Bool []
-    todo("exif-nv.exiforient.swaps_dimensions")
+    match o
+        ExifUpright          => false
+        ExifMirrorH          => false
+        ExifRotate180        => false
+        ExifMirrorV          => false
+        ExifMirrorHRotate90  => true
+        ExifRotate90         => true
+        ExifMirrorHRotate270 => true
+        ExifRotate270        => true
 
 // Whether restoring this orientation mirrors the image.
 //
@@ -132,7 +196,15 @@ pub fn swaps_dimensions(o: ExifOrientation) -> Bool []
 //     println("${exiforient.mirrors(ExifRotate90)}")   // false
 // ```
 pub fn mirrors(o: ExifOrientation) -> Bool []
-    todo("exif-nv.exiforient.mirrors")
+    match o
+        ExifUpright          => false
+        ExifMirrorH          => true
+        ExifRotate180        => false
+        ExifMirrorV          => true
+        ExifMirrorHRotate90  => true
+        ExifRotate90         => false
+        ExifMirrorHRotate270 => true
+        ExifRotate270        => false
 
 // How many degrees clockwise restoring this orientation turns the
 // image: 0, 90, 180 or 270.
@@ -147,7 +219,15 @@ pub fn mirrors(o: ExifOrientation) -> Bool []
 //     println("${exiforient.rotation_degrees(ExifMirrorHRotate270)}")   // 270
 // ```
 pub fn rotation_degrees(o: ExifOrientation) -> Int []
-    todo("exif-nv.exiforient.rotation_degrees")
+    match o
+        ExifUpright          => 0
+        ExifMirrorH          => 0
+        ExifRotate180        => 180
+        ExifMirrorV          => 180
+        ExifMirrorHRotate90  => 90
+        ExifRotate90         => 90
+        ExifMirrorHRotate270 => 270
+        ExifRotate270        => 270
 
 // The orientation that undoes this one.
 //
@@ -166,7 +246,7 @@ pub fn rotation_degrees(o: ExifOrientation) -> Int []
 //     println(exiforient.orientation_name(exiforient.after_applying(ExifRotate90)))
 // ```
 pub fn after_applying(o: ExifOrientation) -> ExifOrientation []
-    todo("exif-nv.exiforient.after_applying")
+    ExifUpright
 
 // The orientation that is this one followed by that one.
 //
@@ -183,4 +263,16 @@ pub fn after_applying(o: ExifOrientation) -> ExifOrientation []
 //         exiforient.compose(ExifRotate90, ExifRotate90)))   // rotate-180
 // ```
 pub fn compose(first: ExifOrientation, second: ExifOrientation) -> ExifOrientation []
-    todo("exif-nv.exiforient.compose")
+    let m1 = mirrors(first)
+    let m2 = mirrors(second)
+    let r1 = rotation_degrees(first)
+    let r2 = rotation_degrees(second)
+    let m = if m1
+        not m2
+    else
+        m2
+    let deg = if m2
+        norm360(r2 - r1)
+    else
+        norm360(r1 + r2)
+    orientation_of(m, deg)

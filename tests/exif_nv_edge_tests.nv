@@ -1,0 +1,2245 @@
+// exif_nv_edge_tests.nv — the round trips the four module suites do
+// not reach: a hand-built TIFF in BOTH byte orders, every one of the
+// twelve types parsed and written back, the two containers' segments
+// taken out and put back, and every refusal arm.
+//
+// THE BYTE ORDERS ARE THE POINT.  A file's byte order is set by its
+// own TIFF header and nothing else, and a reader that hard-codes one
+// order reads every other file wrong in a way no single-order fixture
+// can show.  The fixture below is written twice, byte for byte, and
+// every value it holds is asserted equal across the two.
+//
+// A RATIONAL IS TWO INTEGERS AND MUST SURVIVE AS TWO.  `1/3` and
+// `1/10` have no exact binary fraction, so a reader that collapsed
+// them to a float could not write either back.  Both are carried
+// through a parse and a write and compared by their two integers, and
+// the whole structure is compared byte for byte.
+//
+// The rest is an exhaustion pass: every type code once, every
+// container once, and every refusal arm once.
+
+use std.test
+use std.list
+use std.bytes
+use std.codec
+use std.math
+use std.str
+use exiffault
+use exiftag
+use exifvalue
+use exiforient
+use exifdata
+use exifread
+use exifwrite
+
+// ── little writers, for the fixtures ─────────────────────────────────
+
+fn put16(var buf: Bytes, at: Int, v: Int, order: ExifByteOrder)
+    if order == ExifLittleEndian
+        bytes.set_u16_le(buf, at, v)
+    else
+        bytes.set_u16_be(buf, at, v)
+
+fn put32(var buf: Bytes, at: Int, v: Int, order: ExifByteOrder)
+    if order == ExifLittleEndian
+        bytes.set_u32_le(buf, at, v)
+    else
+        bytes.set_u32_be(buf, at, v)
+
+fn put64(var buf: Bytes, at: Int, v: Int, order: ExifByteOrder)
+    if order == ExifLittleEndian
+        bytes.set_u64_le(buf, at, v)
+    else
+        bytes.set_u64_be(buf, at, v)
+
+fn u32_at(b: Bytes, at: Int, order: ExifByteOrder) -> Int
+    if order == ExifLittleEndian
+        bytes.u32_le_at(b, at) ?? 0 - 1
+    else
+        bytes.u32_be_at(b, at) ?? 0 - 1
+
+// The header both fixtures begin with, and the magic number.
+fn put_header(var b: Bytes, first_ifd: Int, order: ExifByteOrder)
+    if order == ExifLittleEndian
+        bytes.set_u8(b, 0, 0x49)
+        bytes.set_u8(b, 1, 0x49)
+    else
+        bytes.set_u8(b, 0, 0x4D)
+        bytes.set_u8(b, 1, 0x4D)
+    put16(b, 2, 42, order)
+    put32(b, 4, first_ifd, order)
+
+// The ASCII of a short field, one byte at a time, so the two orders
+// write the same bytes.
+fn put_ascii(var b: Bytes, at: Int, text: Str)
+    var i = 0
+    let raw = bytes.from_str(text)
+    while i < bytes.len(raw)
+        bytes.set_u8(b, at + i, bytes.byte_at(raw, i) ?? 0)
+        i = i + 1
+
+// ── the fixture both orders carry ────────────────────────────────────
+//
+// 114 bytes: a 0th IFD at 8 with four entries, an Exif IFD at 62 with
+// two, and the three values too long for an entry at 92, 98 and 106.
+// Every number below is counted by hand from TIFF 6.0 section 2: an
+// entry is twelve bytes, a value of four bytes or fewer sits inside
+// it, and everything else sits at an offset counted from the header.
+
+fn fixture(order: ExifByteOrder) -> Bytes
+    var b = bytes.zeros(114)
+    put_header(b, 8, order)
+    put16(b, 8, 4, order)   // four entries in the 0th
+    // ImageDescription, ASCII, count 6, six bytes at 92
+    put16(b, 10, 0x010E, order)
+    put16(b, 12, 2, order)
+    put32(b, 14, 6, order)
+    put32(b, 18, 92, order)
+    // Orientation, SHORT, count 1, inline: the six is the value
+    put16(b, 22, 0x0112, order)
+    put16(b, 24, 3, order)
+    put32(b, 26, 1, order)
+    put16(b, 30, 6, order)
+    // XResolution, RATIONAL, count 1, eight bytes at 98
+    put16(b, 34, 0x011A, order)
+    put16(b, 36, 5, order)
+    put32(b, 38, 1, order)
+    put32(b, 42, 98, order)
+    // ExifIFDPointer, LONG, count 1, inline: the Exif IFD is at 62
+    put16(b, 46, 0x8769, order)
+    put16(b, 48, 4, order)
+    put32(b, 50, 1, order)
+    put32(b, 54, 62, order)
+    put32(b, 58, 0, order)   // no 1st IFD
+    put16(b, 62, 2, order)   // two entries in the Exif IFD
+    // ExposureTime, RATIONAL, count 1, eight bytes at 106
+    put16(b, 64, 0x829A, order)
+    put16(b, 66, 5, order)
+    put32(b, 68, 1, order)
+    put32(b, 72, 106, order)
+    // ExifVersion, UNDEFINED, count 4, inline: the bytes "0232"
+    put16(b, 76, 0x9000, order)
+    put16(b, 78, 7, order)
+    put32(b, 80, 4, order)
+    put_ascii(b, 84, "0232")
+    put32(b, 88, 0, order)   // no next directory
+    put_ascii(b, 92, "hello")   // count 6, the NUL included
+    put32(b, 98, 72, order)   // XResolution numerator
+    put32(b, 102, 1, order)   // XResolution denominator
+    put32(b, 106, 1, order)   // ExposureTime numerator
+    put32(b, 110, 3, order)   // ExposureTime denominator
+    b
+
+// The thumbnail fixture: 122 bytes, a 0th IFD at 8 with three entries,
+// a 1st IFD at 50 naming a four-byte thumbnail at 118, an Exif IFD at
+// 80 with a MakerNote whose eight bytes are at 110, and — when `strip`
+// is true — a StripOffsets entry, which a rewrite cannot keep because
+// it names image data the rebuilt structure no longer sits beside.
+fn chain_fixture(strip: Bool) -> Bytes
+    let o = ExifLittleEndian
+    var b = bytes.zeros(122)
+    put_header(b, 8, o)
+    put16(b, 8, 3, o)
+    // In ascending tag order, which TIFF 6.0 requires and which is the
+    // order the writer lays them down in: 0x0111 < 0x0112 < 0x0128.
+    if strip
+        put16(b, 10, 0x0111, o)   // StripOffsets, LONG, count 1
+        put16(b, 12, 4, o)
+        put32(b, 14, 1, o)
+        put32(b, 18, 106, o)
+    else
+        put16(b, 10, 0x0112, o)   // Orientation, SHORT, count 1
+        put16(b, 12, 3, o)
+        put32(b, 14, 1, o)
+        put16(b, 18, 6, o)
+    if strip
+        put16(b, 22, 0x0112, o)   // Orientation, SHORT, count 1
+    else
+        put16(b, 22, 0x0128, o)   // ResolutionUnit, SHORT, count 1
+    put16(b, 24, 3, o)
+    put32(b, 26, 1, o)
+    put16(b, 30, 2, o)
+    put16(b, 34, 0x8769, o)   // the Exif IFD is at 80
+    put16(b, 36, 4, o)
+    put32(b, 38, 1, o)
+    put32(b, 42, 80, o)
+    put32(b, 46, 50, o)   // the 1st IFD is at 50
+    put16(b, 50, 2, o)
+    put16(b, 52, 0x0201, o)   // JPEGInterchangeFormat, at 118
+    put16(b, 54, 4, o)
+    put32(b, 56, 1, o)
+    put32(b, 60, 118, o)
+    put16(b, 64, 0x0202, o)   // JPEGInterchangeFormatLength, 4
+    put16(b, 66, 4, o)
+    put32(b, 68, 1, o)
+    put32(b, 72, 4, o)
+    put32(b, 76, 0, o)   // no 2nd IFD
+    put16(b, 80, 2, o)
+    put16(b, 82, 0x9000, o)   // ExifVersion, inline
+    put16(b, 84, 7, o)
+    put32(b, 86, 4, o)
+    put_ascii(b, 90, "0232")
+    put16(b, 94, 0x927C, o)   // MakerNote, eight bytes at 110
+    put16(b, 96, 7, o)
+    put32(b, 98, 8, o)
+    put32(b, 102, 110, o)
+    put32(b, 106, 0, o)
+    put_ascii(b, 110, "NIKON")
+    put_ascii(b, 116, "NN")   // the two padding bytes of the note
+    bytes.set_u8(b, 118, 0xFF)   // and the thumbnail: FFD8FFD9
+    bytes.set_u8(b, 119, 0xD8)
+    bytes.set_u8(b, 120, 0xFF)
+    bytes.set_u8(b, 121, 0xD9)
+    b
+
+// The bytes every Thumbnail tag in that fixture points at.
+fn thumbnail_four_bytes() -> Bytes
+    bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xD9])
+
+// ── a JPEG and a PNG around a block ──────────────────────────────────
+//
+// `FF D8`, an APP1 segment whose payload is `Exif\0\0` and the block,
+// then a quantization table and the end of image.  The block sits at
+// offset 12, which is where every offset inside it is relative from.
+
+fn jpeg_with(block: Bytes) -> Bytes
+    let n = bytes.len(block)
+    var b = bytes.zeros(20 + n)
+    bytes.set_u8(b, 0, 0xFF)
+    bytes.set_u8(b, 1, 0xD8)
+    bytes.set_u8(b, 2, 0xFF)
+    bytes.set_u8(b, 3, 0xE1)
+    bytes.set_u16_be(b, 4, n + 8)
+    put_ascii(b, 6, "Exif")
+    bytes.set_u8(b, 10, 0x00)
+    bytes.set_u8(b, 11, 0x00)
+    var i = 0
+    while i < n
+        bytes.set_u8(b, 12 + i, bytes.byte_at(block, i) ?? 0)
+        i = i + 1
+    bytes.set_u8(b, 12 + n, 0xFF)
+    bytes.set_u8(b, 13 + n, 0xDB)
+    bytes.set_u16_be(b, 14 + n, 4)
+    bytes.set_u8(b, 16 + n, 0x00)
+    bytes.set_u8(b, 17 + n, 0x43)
+    bytes.set_u8(b, 18 + n, 0xFF)
+    bytes.set_u8(b, 19 + n, 0xD9)
+    b
+
+fn jpeg_bare() -> Bytes
+    bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x04, 0x00, 0x43, 0xFF, 0xD9])
+
+// `89 50 4E 47 0D 0A 1A 0A`, an IHDR chunk of thirteen bytes, then an
+// eXIf chunk when there is a block, then IDAT and IEND.  The eXIf chunk
+// sits at 33, right after IHDR, which is where the third edition puts
+// it and where the writer puts it.
+
+fn png_with(block: Bytes) -> Bytes
+    let n = bytes.len(block)
+    var b = bytes.zeros(61 + (if n > 0 then 12 + n else 0))
+    bytes.set_u8(b, 0, 0x89)
+    bytes.set_u8(b, 1, 0x50)
+    bytes.set_u8(b, 2, 0x4E)
+    bytes.set_u8(b, 3, 0x47)
+    bytes.set_u8(b, 4, 0x0D)
+    bytes.set_u8(b, 5, 0x0A)
+    bytes.set_u8(b, 6, 0x1A)
+    bytes.set_u8(b, 7, 0x0A)
+    bytes.set_u32_be(b, 8, 13)
+    put_ascii(b, 12, "IHDR")
+    var i = 0
+    while i < 13
+        bytes.set_u8(b, 16 + i, i)
+        i = i + 1
+    var at = 33
+    if n > 0
+        // The chunk's CRC covers the type and the data, so the fixture
+        // carries the CRC a writer would compute and is a fixed point
+        // of `write` rather than a file with a broken checksum.
+        let name = bytes.from_byte_list([0x65, 0x58, 0x49, 0x66])
+        bytes.set_u32_be(b, at, n)
+        put_ascii(b, at + 4, "eXIf")
+        var k = 0
+        while k < n
+            bytes.set_u8(b, at + 8 + k, bytes.byte_at(block, k) ?? 0)
+            k = k + 1
+        bytes.set_u32_be(b, at + 8 + n, codec.crc32(bytes.concat([name, block])))
+        at = at + 12 + n
+    bytes.set_u32_be(b, at, 4)
+    put_ascii(b, at + 4, "IDAT")
+    put_ascii(b, at + 8, "0000")
+    bytes.set_u32_be(b, at + 12, 0)
+    put_ascii(b, at + 20, "IEND")
+    b
+
+fn png_bare() -> Bytes
+    png_with(bytes.zeros(0))
+
+// ── the fixture of all twelve types ──────────────────────────────────
+//
+// 182 bytes: a 0th IFD at 8 with twelve entries, one per TIFF 6.0 type
+// code, and the three values too long for an entry at 158, 166 and 174.
+// The tags are 0xE000 upwards, which the table does not know: an
+// unknown tag is kept rather than refused, and a tag the table knows
+// would drag in a type the table expects.
+
+fn types_fixture(order: ExifByteOrder) -> Bytes
+    var b = bytes.zeros(182)
+    put_header(b, 8, order)
+    put16(b, 8, 12, order)
+    // BYTE, count 3
+    put16(b, 10, 0xE000, order)
+    put16(b, 12, 1, order)
+    put32(b, 14, 3, order)
+    bytes.set_u8(b, 18, 0x01)
+    bytes.set_u8(b, 19, 0x02)
+    bytes.set_u8(b, 20, 0xFF)
+    // ASCII, count 4
+    put16(b, 22, 0xE001, order)
+    put16(b, 24, 2, order)
+    put32(b, 26, 4, order)
+    put_ascii(b, 30, "abc")
+    // SHORT, count 2
+    put16(b, 34, 0xE002, order)
+    put16(b, 36, 3, order)
+    put32(b, 38, 2, order)
+    put16(b, 42, 1, order)
+    put16(b, 44, 65535, order)
+    // LONG, count 1
+    put16(b, 46, 0xE003, order)
+    put16(b, 48, 4, order)
+    put32(b, 50, 1, order)
+    put32(b, 54, 0x12345678, order)
+    // RATIONAL, count 1, at 158
+    put16(b, 58, 0xE004, order)
+    put16(b, 60, 5, order)
+    put32(b, 62, 1, order)
+    put32(b, 66, 158, order)
+    // SBYTE, count 2
+    put16(b, 70, 0xE005, order)
+    put16(b, 72, 6, order)
+    put32(b, 74, 2, order)
+    bytes.set_u8(b, 78, 0xFF)
+    bytes.set_u8(b, 79, 0x7F)
+    // UNDEFINED, count 4
+    put16(b, 82, 0xE006, order)
+    put16(b, 84, 7, order)
+    put32(b, 86, 4, order)
+    bytes.set_u8(b, 90, 0xDE)
+    bytes.set_u8(b, 91, 0xAD)
+    bytes.set_u8(b, 92, 0xBE)
+    bytes.set_u8(b, 93, 0xEF)
+    // SSHORT, count 1
+    put16(b, 94, 0xE007, order)
+    put16(b, 96, 8, order)
+    put32(b, 98, 1, order)
+    put16(b, 102, 0 - 2, order)
+    // SLONG, count 1
+    put16(b, 106, 0xE008, order)
+    put16(b, 108, 9, order)
+    put32(b, 110, 1, order)
+    put32(b, 114, 0 - 3, order)
+    // SRATIONAL, count 1, at 166
+    put16(b, 118, 0xE009, order)
+    put16(b, 120, 10, order)
+    put32(b, 122, 1, order)
+    put32(b, 126, 166, order)
+    // FLOAT, count 1: the bits of 1.5
+    put16(b, 130, 0xE00A, order)
+    put16(b, 132, 11, order)
+    put32(b, 134, 1, order)
+    put32(b, 138, 0x3FC00000, order)
+    // DOUBLE, count 1, at 174: the bits of 0.1
+    put16(b, 142, 0xE00B, order)
+    put16(b, 144, 12, order)
+    put32(b, 146, 1, order)
+    put32(b, 150, 174, order)
+    put32(b, 158, 1, order)   // RATIONAL 1/3
+    put32(b, 162, 3, order)
+    put32(b, 166, 0 - 1, order)   // SRATIONAL -1/3
+    put32(b, 170, 3, order)
+    put64(b, 174, 0x3FB999999999999A, order)   // DOUBLE 0.1
+    b
+
+// A fixture whose first entry has a bit pattern in a FLOAT field and a
+// DOUBLE field, for the bit-level cases a file can hold but a caller
+// cannot ask for.
+fn float_fixture(order: ExifByteOrder, f_bits: Int, d_bits: Int) -> Bytes
+    var b = bytes.zeros(46)
+    put_header(b, 8, order)
+    put16(b, 8, 2, order)
+    put16(b, 10, 0xE00A, order)   // FLOAT, count 1, inline
+    put16(b, 12, 11, order)
+    put32(b, 14, 1, order)
+    put32(b, 18, f_bits, order)
+    put16(b, 22, 0xE00B, order)   // DOUBLE, count 1, at 38
+    put16(b, 24, 12, order)
+    put32(b, 26, 1, order)
+    put32(b, 30, 38, order)
+    put32(b, 34, 0, order)   // no next directory
+    put64(b, 38, d_bits, order)
+    b
+
+// ── small comparisons ────────────────────────────────────────────────
+
+fn same_bytes(a: Bytes, b: Bytes) -> Bool
+    bytes.to_hex(a) == bytes.to_hex(b)
+
+fn value_text(v: ExifValue) -> Str
+    match v
+        ExifBytes(data)        => bytes.to_hex(data)
+        ExifAscii(data)        => bytes.to_hex(data)
+        ExifShorts(values)     => list_text(values)
+        ExifLongs(values)      => list_text(values)
+        ExifSigneds(values)    => list_text(values)
+        ExifRationals(values)  => str.from_int(list.len(values))
+        ExifSrationals(values) => str.from_int(list.len(values))
+        ExifFloats(values)     => str.from_int(list.len(values))
+
+fn list_text(values: [Int]) -> Str
+    var out = ""
+    for v in values
+        out = out + str.from_int(v) + ","
+    out
+
+fn ok_data(source: Bytes) -> ExifData
+    let found = exifread.read(source, exifread.default_options())!
+    match found
+        Some(d) => d
+        None    =>
+            core.panic.panic("the fixture carries metadata")
+
+// ── the two byte orders ──────────────────────────────────────────────
+
+@test
+fn test_a_hand_written_file_parses_the_same_in_both_byte_orders() [io]
+    let le = ok_data(fixture(ExifLittleEndian))
+    let be = ok_data(fixture(ExifBigEndian))
+
+    test.case("the header says which order, and the order comes back")
+    test.assert(le.byte_order == ExifLittleEndian)
+    test.assert(be.byte_order == ExifBigEndian)
+
+    test.case("the same entries, whatever the order")
+    // The pointer entry that names the Exif IFD is structure rather
+    // than a value: the walk follows it and does not store it, and the
+    // writer lays it down again from the directory it points at.  Four
+    // entries in the 0th (one of them the pointer) and two in the Exif
+    // IFD therefore read back as five.
+    test.assert(exifdata.entry_count(le) == exifdata.entry_count(be))
+    test.assert(exifdata.entry_count(le) == 5)
+    test.assert(list.len(exifdata.entries_in(le, ExifIfdPrimary)) == 3)
+    test.assert(list.len(exifdata.entries_in(be, ExifIfdPrimary)) == 3)
+
+    test.case("the Exif directory hangs off the pointer, not the chain")
+    test.assert(exifdata.has_ifd(le, ExifIfdExif))
+    test.assert(exifdata.has_ifd(be, ExifIfdExif))
+    test.assert(not exifdata.has_ifd(le, ExifIfdGps))
+    test.assert(not exifdata.has_ifd(le, ExifIfdThumbnail))
+
+    test.case("an ASCII field reads the same")
+    match exifdata.value(le, ExifIfdPrimary, 0x010E)
+        Some(v) => test.assert(exifvalue.ascii_text(v) == "hello")
+        None    => test.fail("the description is there")
+    match exifdata.value(be, ExifIfdPrimary, 0x010E)
+        Some(v) => test.assert(exifvalue.ascii_text(v) == "hello")
+        None    => test.fail("the description is there in the other order too")
+
+    test.case("an inline SHORT reads the same")
+    test.assert(exiforient.tag_value(exifdata.orientation(le)) == 6)
+    test.assert(exiforient.tag_value(exifdata.orientation(be)) == 6)
+
+    test.case("a RATIONAL is the two integers the file holds, in either order")
+    let r_le = first_ratio_in(le, ExifIfdPrimary, 0x011A)
+    let r_be = first_ratio_in(be, ExifIfdPrimary, 0x011A)
+    test.assert(r_le.numerator == 72)
+    test.assert(r_le.denominator == 1)
+    test.assert(r_be.numerator == r_le.numerator)
+    test.assert(r_be.denominator == r_le.denominator)
+
+    test.case("and so is the one that has no exact decimal")
+    let e_le = first_ratio_in(le, ExifIfdExif, 0x829A)
+    let e_be = first_ratio_in(be, ExifIfdExif, 0x829A)
+    test.assert(e_le.numerator == 1)
+    test.assert(e_le.denominator == 3)
+    test.assert(exifvalue.format_ratio(e_le) == "1/3")
+    test.assert(e_be.numerator == e_le.numerator)
+    test.assert(e_be.denominator == e_le.denominator)
+
+    test.case("an UNDEFINED field is its bytes")
+    let x = value_of(le, ExifIfdExif, 0x9000)
+    test.assert(value_text(x) == bytes.to_hex(bytes.from_str("0232")))
+    let y = value_of(be, ExifIfdExif, 0x9000)
+    test.assert(value_text(y) == value_text(x))
+
+    test.case("the whole structure reads clean in both orders")
+    test.assert(finding_count_of(fixture(ExifLittleEndian)) == 0)
+    test.assert(finding_count_of(fixture(ExifBigEndian)) == 0)
+
+@test
+fn test_a_parse_and_write_is_byte_identical_in_both_orders() [io]
+    // The writer lays the block down in one order — directories,
+    // then the values too long for an entry — and the fixture above is
+    // written to that same shape by hand, so a parse followed by a
+    // write must give the file back byte for byte.  Anything else is
+    // an offset, a padding byte or a pointer that the writer and the
+    // reader disagree about.
+    let le = fixture(ExifLittleEndian)
+    let be = fixture(ExifBigEndian)
+
+    test.case("the little-endian file")
+    let out_le = exifwrite.write(le, ok_data(le), ExifContainerTiff)!
+    test.assert(same_bytes(out_le, le))
+
+    test.case("and the big-endian one, which must not be flipped")
+    let out_be = exifwrite.write(be, ok_data(be), ExifContainerTiff)!
+    test.assert(same_bytes(out_be, be))
+
+    test.case("a second trip is the same bytes as the first")
+    let again = exifwrite.write(out_le, ok_data(out_le), ExifContainerTiff)!
+    test.assert(same_bytes(again, out_le))
+    let again_be = exifwrite.write(out_be, ok_data(out_be), ExifContainerTiff)!
+    test.assert(same_bytes(again_be, out_be))
+
+    test.case("and the block the caller builds alone is that same block")
+    test.assert(same_bytes(exifwrite.to_tiff_block(ok_data(le))!, le))
+    test.assert(exifwrite.block_size(ok_data(le)) == bytes.len(le))
+
+fn first_ratio_in(d: ExifData, i: ExifIfd, tag: Int) -> ExifRational
+    match exifdata.value(d, i, tag)
+        None    =>
+            core.panic.panic("the fixture carries that tag")
+        Some(v) =>
+            // The indented block form of the diverging call, not the
+            // inline one: an inline `Never`-typed arm body is refused
+            // as a `Unit` arm (language/
+            // a-never-typed-call-as-an-inline-match-arm-body-is-refused).
+            match exifvalue.first_ratio(v)
+                None    =>
+                    core.panic.panic("the fixture makes that tag a rational")
+                Some(r) => r
+
+fn value_of(d: ExifData, i: ExifIfd, tag: Int) -> ExifValue
+    match exifdata.value(d, i, tag)
+        None    =>
+            core.panic.panic("the fixture carries that tag")
+        Some(v) => v
+
+fn finding_count_of(source: Bytes) -> Int
+    let report = exifread.read_report(source, exifread.default_options())!
+    match report
+        None    =>
+            core.panic.panic("the fixture carries metadata")
+        Some(r) => exifdata.finding_count(r)
+
+// ── the twelve types ─────────────────────────────────────────────────
+
+@test
+fn test_all_twelve_types_round_trip_in_both_orders() [io]
+    let orders = [ExifLittleEndian, ExifBigEndian]
+    for o in orders
+        let f = types_fixture(o)
+        let d = ok_data(f)
+        test.case("twelve entries, one per TIFF 6.0 type code")
+        test.assert(exifdata.entry_count(d) == 12)
+        test.assert(finding_count_of(f) == 0)
+
+        test.case("BYTE is its bytes, uninterpreted")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE000)) == "0102ff")
+
+        test.case("ASCII keeps the trailing NUL the count includes")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE001))
+            == bytes.to_hex(bytes.from_str("abc\0")))
+
+        test.case("SHORT holds its full range")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE002)) == "1,65535,")
+
+        test.case("LONG is four bytes and the top bit is a number")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE003)) == "305419896,")
+
+        test.case("RATIONAL is two unsigned integers")
+        let r = first_ratio_in(d, ExifIfdPrimary, 0xE004)
+        test.assert(exifvalue.format_ratio(r) == "1/3")
+
+        test.case("SBYTE, SSHORT and SLONG are signed")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE005)) == "-1,127,")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE007)) == "-2,")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE008)) == "-3,")
+
+        test.case("and a signed number under the sign bit is itself")
+        // The other side of the two's-complement step: only a reading
+        // at or above the sign bit is a negative number, and a reader
+        // that subtracted unconditionally would answer -65236 here.
+        var positive = types_fixture(o)
+        put16(positive, 102, 300, o)
+        let dp = ok_data(positive)
+        test.assert(value_text(value_of(dp, ExifIfdPrimary, 0xE007)) == "300,")
+
+        test.case("UNDEFINED is the bytes as they stand")
+        test.assert(value_text(value_of(d, ExifIfdPrimary, 0xE006)) == "deadbeef")
+
+        test.case("SRATIONAL is two signed integers")
+        match exifdata.value(d, ExifIfdPrimary, 0xE009)
+            Some(v) =>
+                match v
+                    ExifSrationals(rs) =>
+                        test.assert(list.len(rs) == 1)
+                        test.assert(list.get(rs, 0).numerator == 0 - 1)
+                        test.assert(list.get(rs, 0).denominator == 3)
+                    _                  => test.fail("that tag is an SRATIONAL")
+            None    => test.fail("that tag is there")
+
+        test.case("FLOAT and DOUBLE, which no EXIF tag uses")
+        let fl = value_of(d, ExifIfdPrimary, 0xE00A)
+        let db = value_of(d, ExifIfdPrimary, 0xE00B)
+        test.assert(exifvalue.type_of(fl) == ExifTypeFloat)
+        test.assert(exifvalue.type_of(db) == ExifTypeFloat)
+        match fl
+            ExifFloats(xs) => test.assert(list.get(xs, 0) == 1.5)
+            _              => test.fail("that tag is a FLOAT")
+        match db
+            ExifFloats(xs) => test.assert(list.get(xs, 0) == 0.1)
+            _              => test.fail("that tag is a DOUBLE")
+
+        test.case("and the file comes back byte for byte")
+        let out = exifwrite.write(f, d, ExifContainerTiff)!
+        test.assert(same_bytes(out, f))
+
+@test
+fn test_the_float_encoders_carry_the_bits_a_file_can_hold() [io]
+    // A subnormal, a zero, an infinity, a not-a-number and a negative
+    // zero are all bit patterns a file can hold and no arithmetic
+    // reaches.  Each is parsed and written back, in both orders, and
+    // compared byte for byte: an encoder that answers a canonical NaN
+    // for every NaN still has to answer the same bits for this one.
+    let orders = [ExifLittleEndian, ExifBigEndian]
+    for o in orders
+        for f_bits in [0x00000000, 0x80000000, 0x3FC00000, 0x000002CA, 0x7F800000, 0xFF800000,
+                       0x7FC00000]
+            let f = float_fixture(o, f_bits, 0x3FB999999999999A)
+            let d = ok_data(f)
+            test.case("a FLOAT of these bits survives")
+            let out = exifwrite.write(f, d, ExifContainerTiff)!
+            test.assert(same_bytes(out, f))
+        for d_bits in [0x0000000000000000, 0x8000000000000000, 0x3FF0000000000000, 0x0000000000000001, 0x7FF0000000000000, 0xFFF0000000000000,
+                       0x7FF8000000000000]
+            let f = float_fixture(o, 0x3FC00000, d_bits)
+            let d = ok_data(f)
+            test.case("and a DOUBLE of these bits")
+            let out = exifwrite.write(f, d, ExifContainerTiff)!
+            test.assert(same_bytes(out, f))
+
+@test
+fn test_a_caller_set_float_is_written_as_the_nearest_float() [io]
+    let d = exifdata.set(exifdata.empty(ExifLittleEndian), ExifIfdPrimary, 0xE00A,
+                         ExifFloats([1.5]))
+    let block = exifwrite.to_tiff_block(d)!
+    test.case("1.5 is exact in a FLOAT field")
+    test.assert(u32_at(block, 18, ExifLittleEndian) == 0x3FC00000)
+
+    test.case("a value past the FLOAT range is written as infinity")
+    let big = exifdata.set(d, ExifIfdPrimary, 0xE00A, ExifFloats([math.pow(10.0, 300.0)]))
+    let h = exifwrite.to_tiff_block(big)!
+    test.assert(u32_at(h, 18, ExifLittleEndian) == 0x7F800000)
+
+    test.case("and one just under a power of two rounds up into it")
+    // 0.9999999999 is nearer to 1.0 than to the next FLOAT down, and
+    // the rounding carries the all-ones mantissa into the exponent.
+    let near = exifdata.set(d, ExifIfdPrimary, 0xE00A, ExifFloats([1.0 - 0.0000000001]))
+    let k = exifwrite.to_tiff_block(near)!
+    test.assert(u32_at(k, 18, ExifLittleEndian) == 0x3F800000)
+
+@test
+fn test_a_rational_is_written_as_the_two_integers_it_is() [io]
+    // 0.1 and 1/3 have no exact binary fraction, which is why a
+    // reader that handed back a float could not write either of them
+    // back.  Both go through a write and a read as two integers.
+    var d = exifdata.empty(ExifLittleEndian)
+    d = exifdata.set(d, ExifIfdPrimary, 0xE100, ExifRationals([ExifRational { numerator: 1, denominator: 10 }]))
+    d = exifdata.set(d, ExifIfdPrimary, 0xE101, ExifRationals([ExifRational { numerator: 1, denominator: 3 }]))
+    d = exifdata.set(d, ExifIfdPrimary, 0xE102, ExifRationals([ExifRational { numerator: 10, denominator: 2000 }]))
+    d = exifdata.set(d, ExifIfdExif, 0xE103, ExifSrationals([ExifSrational { numerator: 0 - 3, denominator: 10 }]))
+
+    let block = exifwrite.to_tiff_block(d)!
+    let back = ok_data(block)
+
+    test.case("1/10 did not become a float")
+    let a = first_ratio_in(back, ExifIfdPrimary, 0xE100)
+    test.assert(a.numerator == 1)
+    test.assert(a.denominator == 10)
+    test.assert(exifvalue.format_ratio(a) == "1/10")
+
+    test.case("1/3 neither")
+    let b = first_ratio_in(back, ExifIfdPrimary, 0xE101)
+    test.assert(b.numerator == 1)
+    test.assert(b.denominator == 3)
+
+    test.case("and 10/2000 is not normalised into 1/200")
+    let c = first_ratio_in(back, ExifIfdPrimary, 0xE102)
+    test.assert(c.numerator == 10)
+    test.assert(c.denominator == 2000)
+    test.assert(exifvalue.format_ratio(c) == "10/2000")
+
+    test.case("-3/10 keeps its sign in the numerator")
+    match exifdata.value(back, ExifIfdExif, 0xE103)
+        Some(v) =>
+            match v
+                ExifSrationals(rs) => test.assert(list.get(rs, 0).numerator == 0 - 3)
+                _                  => test.fail("that tag is an SRATIONAL")
+        None    => test.fail("that tag is there")
+
+    test.case("the block the caller built is stable across a write")
+    test.assert(same_bytes(exifwrite.to_tiff_block(back)!, block))
+
+    test.case("and 10/2000 in a JPEG segment is the same two integers")
+    let jpg = exifwrite.write(jpeg_bare(), d, ExifContainerJpeg)!
+    let from_jpeg = ok_data(jpg)
+    let e = first_ratio_in(from_jpeg, ExifIfdPrimary, 0xE102)
+    test.assert(e.denominator == 2000)
+
+// ── the eight orientations, in a file ────────────────────────────────
+
+// The eight tags in the specification's order.
+fn all_orientations() -> [ExifOrientation]
+    [ExifUpright, ExifMirrorH, ExifRotate180, ExifMirrorV,
+     ExifMirrorHRotate90, ExifRotate90, ExifMirrorHRotate270, ExifRotate270]
+
+fn tag_of(o: ExifOrientation) -> Int
+    exiforient.tag_value(o)
+
+fn compose_tag(a: ExifOrientation, b: ExifOrientation) -> Int
+    exiforient.tag_value(exiforient.compose(a, b))
+
+@test
+fn test_all_eight_orientations_survive_a_file_and_the_group_closes() [io]
+    // Reading an orientation and APPLYING it have to be the same
+    // transform: the classic defect is a viewer that applies the
+    // inverse of what the tag says, which is invisible on 1 and 3 and
+    // wrong on all the other six.  Each of the eight is written into a
+    // file, read back, and checked against the group's own laws.
+    for o in all_orientations()
+        let d = exifdata.with_orientation(ok_data(fixture(ExifLittleEndian)), o)
+        let block = exifwrite.to_tiff_block(d)!
+        let back = exifread.read_orientation(block)
+        test.case("the tag survives a write and a read")
+        test.assert(tag_of(back) == tag_of(o))
+
+        test.case("and what it says it does is what applying it does")
+        // Applying it is clearing the tag, and a cleared tag is upright.
+        test.assert(tag_of(exiforient.after_applying(back)) == 1)
+        test.assert(exiforient.swaps_dimensions(back)
+            == (exiforient.rotation_degrees(back) == 90
+                or exiforient.rotation_degrees(back) == 270))
+
+    test.case("upright is the identity on both sides")
+    for o in all_orientations()
+        test.assert(compose_tag(ExifUpright, o) == tag_of(o))
+        test.assert(compose_tag(o, ExifUpright) == tag_of(o))
+
+    test.case("an orientation that is its own inverse twice is the identity")
+    // Six of the eight: the four mirrors and the half turn, and the two
+    // mirrored quarter turns, which are reflections like the mirrors.
+    for o in [ExifUpright, ExifMirrorH, ExifRotate180, ExifMirrorV,
+              ExifMirrorHRotate90, ExifMirrorHRotate270]
+        test.assert(compose_tag(o, o) == 1)
+
+    test.case("and the two quarter turns are each other's inverse")
+    test.assert(compose_tag(ExifRotate90, ExifRotate90) == 3)
+    test.assert(compose_tag(ExifRotate270, ExifRotate270) == 3)
+    test.assert(compose_tag(ExifRotate90, ExifRotate270) == 1)
+    test.assert(compose_tag(ExifRotate270, ExifRotate90) == 1)
+
+    test.case("every one of the eight has an inverse among the eight")
+    for o in all_orientations()
+        var inverses = 0
+        for c in all_orientations()
+            if compose_tag(o, c) == 1
+                inverses = inverses + 1
+        test.assert(inverses == 1)
+
+    test.case("the group is not commutative, and the order is the tag's")
+    test.assert(compose_tag(ExifMirrorH, ExifRotate90) == 5)
+    test.assert(compose_tag(ExifRotate90, ExifMirrorH) == 7)
+
+    test.case("and composing is associative on a triple")
+    let left = exiforient.compose(exiforient.compose(ExifMirrorH, ExifRotate90),
+                                  ExifMirrorHRotate90)
+    let right = exiforient.compose(ExifMirrorH,
+                                   exiforient.compose(ExifRotate90, ExifMirrorHRotate90))
+    test.assert(tag_of(left) == tag_of(right))
+
+@test
+fn test_setting_the_orientation_edits_two_bytes_and_nothing_else() [io]
+    let le = fixture(ExifLittleEndian)
+    let out = exifwrite.set_orientation(le, ExifRotate270)!
+    let diffs = differing_offsets(le, out)
+
+    test.case("the file's length does not change")
+    test.assert(bytes.len(out) == bytes.len(le))
+
+    test.case("the tag reads back as what was set")
+    test.assert(tag_of(exifread.read_orientation(out)) == 8)
+
+    test.case("and only the entry's own two-byte value field moved")
+    // The orientation entry's twelve bytes begin at 22, so its value
+    // field is the two bytes at 30 and 31.
+    test.assert(list.len(diffs) >= 1)
+    test.assert(list.len(diffs) <= 2)
+    for at in diffs
+        test.assert(at >= 30 and at <= 31)
+
+    test.case("a big-endian file is edited in its own order")
+    let be = fixture(ExifBigEndian)
+    let out_be = exifwrite.set_orientation(be, ExifRotate180)!
+    test.assert(tag_of(exifread.read_orientation(out_be)) == 3)
+    for at in differing_offsets(be, out_be)
+        test.assert(at >= 30 and at <= 31)
+
+    test.case("a JPEG is edited at the container's own offset")
+    let jpeg = jpeg_with(le)
+    let out_jpeg = exifwrite.set_orientation(jpeg, ExifRotate90)!
+    test.assert(exiforient.orientation_name(exifread.read_orientation(out_jpeg))
+        == "rotate-90")
+    for at in differing_offsets(jpeg, out_jpeg)
+        test.assert(at >= 42 and at <= 43)
+
+    test.case("and the narrow write agrees with the whole one")
+    // Two code paths — an in-place edit and a rebuilt block — must
+    // agree about where the orientation entry is.
+    let rebuilt = exifwrite.to_tiff_block(
+        exifdata.with_orientation(ok_data(le), ExifRotate270))!
+    test.assert(same_bytes(out, rebuilt))
+
+fn differing_offsets(a: Bytes, b: Bytes) -> [Int]
+    var out: [Int] = []
+    var i = 0
+    let n = if bytes.len(a) < bytes.len(b)
+        bytes.len(a)
+    else
+        bytes.len(b)
+    while i < n
+        if bytes.byte_at(a, i) != bytes.byte_at(b, i)
+            list.push(out, i)
+        i = i + 1
+    out
+
+@test
+fn test_setting_the_orientation_refuses_what_it_cannot_edit() [io]
+    // A file with no orientation entry is a rewrite, and the rewrite is
+    // `write`.  An entry whose type or count is not what the tag says
+    // is refused by name, because two bytes is what this write
+    // promises to touch.
+    let no_orientation = exifwrite.to_tiff_block(exifdata.set(
+        exifdata.empty(ExifLittleEndian), ExifIfdPrimary, 0x010E,
+        exifvalue.ascii_value("a caption")))!
+
+    test.case("a file whose 0th IFD has no orientation entry")
+    match exifwrite.set_orientation(no_orientation, ExifUpright)
+        Ok(_)  => test.fail("there is no entry to edit")
+        Err(e) =>
+            test.assert(exiffault.code(e) == "no_exif")
+            test.assert(exiffault.tag_of(e) == 0 - 1)
+
+    test.case("but reading one is upright, which is not a refusal")
+    test.assert(tag_of(exifread.read_orientation(no_orientation)) == 1)
+
+    test.case("an orientation entry the file declared as a LONG")
+    var long_one = fixture(ExifLittleEndian)
+    put16(long_one, 24, 4, ExifLittleEndian)   // type LONG
+    match exifwrite.set_orientation(long_one, ExifRotate90)
+        Ok(_)  => test.fail("a LONG is not the type the tag has")
+        Err(e) =>
+            test.assert(exiffault.code(e) == "wrong_type_for_tag")
+            test.assert(exiffault.tag_of(e) == 0x0112)
+
+    test.case("the reader takes it anyway, because the file said so")
+    test.assert(tag_of(exifread.read_orientation(long_one)) == 6)
+
+    test.case("an orientation entry with a count of two")
+    var two = fixture(ExifLittleEndian)
+    put32(two, 26, 2, ExifLittleEndian)
+    match exifwrite.set_orientation(two, ExifRotate90)
+        Ok(_)  => test.fail("the tag holds one SHORT")
+        Err(e) => test.assert(exiffault.code(e) == "count_mismatch")
+
+    test.case("bytes that are no container at all")
+    match exifwrite.set_orientation(bytes.from_byte_list([0x47, 0x49, 0x46]), ExifUpright)
+        Ok(_)  => test.fail("a GIF carries no TIFF header")
+        Err(e) => test.assert(exiffault.code(e) == "no_exif")
+
+// ── the three containers ─────────────────────────────────────────────
+
+@test
+fn test_a_jpeg_takes_the_segment_out_and_puts_a_new_one_in() [io]
+    let fa = fixture(ExifLittleEndian)
+    let d = ok_data(fa)
+    let jpeg = jpeg_with(fa)
+
+    test.case("the structure sits ten bytes past the APP1 marker")
+    match exifread.tiff_offset(jpeg)
+        Some(n) => test.assert(n == 12)
+        None    => test.fail("the APP1 segment is there")
+    test.assert(exifread.has_exif(jpeg))
+
+    test.case("writing it back is byte-identical, marker and all")
+    // The marker is the byte a reader looks for, so the writer has to
+    // put it back: a segment written without one is unreadable.
+    let out = exifwrite.write(jpeg, d, ExifContainerJpeg)!
+    test.assert(same_bytes(out, jpeg))
+    test.assert(exifread.has_exif(out))
+
+    test.case("the length field counts itself and the identifier")
+    test.assert(bytes.u16_be_at(out, 4) == Some(bytes.len(fa) + 8))
+
+    test.case("a JPEG with no segment gets one right after the start")
+    let fresh = exifwrite.write(jpeg_bare(), d, ExifContainerJpeg)!
+    test.assert(same_bytes(fresh, jpeg))
+    test.assert(bytes.len(fresh) == bytes.len(jpeg))
+
+    test.case("writing twice does not leave two segments")
+    let twice = exifwrite.write(fresh, d, ExifContainerJpeg)!
+    test.assert(bytes.len(twice) == bytes.len(fresh))
+
+    test.case("stripping answers the JPEG the segment was added to")
+    let stripped = exifwrite.strip(fresh)!
+    test.assert(same_bytes(stripped, jpeg_bare()))
+    test.assert(not exifread.has_exif(stripped))
+
+    test.case("an APP1 segment over the ceiling is refused")
+    let huge = exifdata.set(exifdata.empty(ExifLittleEndian), ExifIfdPrimary,
+                            0xE200, ExifBytes(bytes.zeros(65510)))
+    match exifwrite.write(jpeg_bare(), huge, ExifContainerJpeg)
+        Ok(_)  => test.fail("that segment cannot be written")
+        Err(e) =>
+            test.assert(exiffault.code(e) == "segment_too_large")
+            test.assert(not exiffault.is_fatal(e))
+    match exifwrite.plan(jpeg_bare(), huge, ExifContainerJpeg)
+        Ok(p)  =>
+            test.assert(not p.fits)
+            test.assert(not exifwrite.is_lossless(p))
+        Err(e) => test.fail(e.message())
+
+    test.case("and a TIFF has no such ceiling")
+    match exifwrite.plan(fa, huge, ExifContainerTiff)
+        Ok(p)  => test.assert(p.fits)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_png_chunk_goes_after_ihdr_and_its_crc_verifies() [io]
+    let fa = fixture(ExifLittleEndian)
+    let d = ok_data(fa)
+    let png = png_with(fa)
+
+    test.case("the CRC the writer computes is the standard one")
+    // The IEEE CRC-32 check value, so a mismatch below is the
+    // writer's chunk and not the checksum function.
+    test.assert(codec.crc32(bytes.from_str("123456789")) == 0xCBF43926)
+
+    test.case("reading a PNG finds the structure eight bytes into the chunk")
+    match exifread.tiff_offset(png)
+        Some(n) => test.assert(n == 41)
+        None    => test.fail("the eXIf chunk is there")
+    test.assert(exifread.has_exif(png))
+
+    test.case("writing it back is byte-identical")
+    let out = exifwrite.write(png, d, ExifContainerPng)!
+    test.assert(same_bytes(out, png))
+
+    test.case("the chunk's length excludes its own header")
+    test.assert(bytes.u32_be_at(out, 33) == Some(bytes.len(fa)))
+
+    test.case("and its CRC covers the type and the data, and nothing else")
+    let body = bytes.slice(out, 37, 41 + bytes.len(fa))
+    test.assert(bytes.u32_be_at(out, 41 + bytes.len(fa)) == Some(codec.crc32(body)))
+    test.assert(bytes.to_str(bytes.slice(out, 37, 41)) == "eXIf")
+
+    test.case("a PNG with no chunk gets one directly after IHDR")
+    let fresh = exifwrite.write(png_bare(), d, ExifContainerPng)!
+    test.assert(same_bytes(fresh, png))
+    test.assert(same_bytes(bytes.slice(fresh, 0, 33), bytes.slice(png_bare(), 0, 33)))
+
+    test.case("the length of the first chunk is what the insertion point comes from")
+    // A PNG whose first chunk is longer than an IHDR still gets its
+    // chunk after that first chunk and not at a hard-coded 33.
+    var tall = png_bare()
+    bytes.set_u32_be(tall, 8, 20)
+    var wide = bytes.zeros(bytes.len(tall) + 7)
+    bytes.copy_into(wide, 0, tall, 0, 8)
+    bytes.copy_into(wide, 8, tall, 8, 12)
+    bytes.copy_into(wide, 27, tall, 20, bytes.len(tall) - 20)
+    let placed = exifwrite.write(wide, d, ExifContainerPng)!
+    test.assert(exifread.has_exif(placed))
+    test.assert(bytes.to_str(bytes.slice(placed, 44, 48)) == "eXIf")
+    test.assert(same_bytes(bytes.slice(placed, 0, 40), bytes.slice(wide, 0, 40)))
+
+    test.case("stripping answers the PNG the chunk was added to")
+    let stripped = exifwrite.strip(fresh)!
+    test.assert(same_bytes(stripped, png_bare()))
+    test.assert(not exifread.has_exif(stripped))
+
+@test
+fn test_stripping_a_tiff_answers_an_empty_buffer() [io]
+    // A bare TIFF's EXIF is the whole file: the structure and the image
+    // data are the same bytes.  A strip therefore answers nothing at
+    // all, and `write` answers the structure with the strip tags
+    // reported as dropped.
+    let fa = fixture(ExifLittleEndian)
+
+    test.case("a TIFF strips to nothing")
+    let out = exifwrite.strip(fa)!
+    test.assert(bytes.len(out) == 0)
+    test.assert(not exifread.has_exif(out))
+
+    test.case("a container that is none of the three comes back unchanged")
+    let gif = bytes.from_byte_list([0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+    let same = exifwrite.strip(gif)!
+    test.assert(same_bytes(same, gif))
+
+    test.case("and so does a container with nothing to strip")
+    let bare = jpeg_bare()
+    test.assert(same_bytes(exifwrite.strip(bare)!, bare))
+    let bare_png = png_bare()
+    test.assert(same_bytes(exifwrite.strip(bare_png)!, bare_png))
+
+// ── what a write would do ────────────────────────────────────────────
+
+@test
+fn test_a_plan_says_what_a_write_would_lose() [io]
+    let chain = chain_fixture(false)
+    let d = ok_data(chain)
+
+    test.case("a file the writer rebuilds exactly loses nothing")
+    // The thumbnail is JPEG only when the 1st IFD's Compression tag
+    // says 6, and this file does not carry the tag at all: a file that
+    // does not say is not taken for JPEG.
+    test.assert(not exifdata.thumbnail_is_jpeg(d))
+    let tagged = exifdata.set(d, ExifIfdThumbnail, 0x0103, ExifShorts([6]))
+    test.assert(exifdata.thumbnail_is_jpeg(tagged))
+    test.assert(not exifdata.thumbnail_is_jpeg(
+        exifdata.set(d, ExifIfdThumbnail, 0x0103, ExifShorts([1]))))
+
+    match exifdata.thumbnail_bytes(d, chain)
+        Some(t) => test.assert(same_bytes(t, thumbnail_four_bytes()))
+        None    => test.fail("the thumbnail is in the buffer")
+
+    test.case("and the MakerNote has no span, which is a gap and not a decision")
+    // `ExifEntry` does not carry where a value sat in the caller's
+    // buffer, so `maker_note_span` answers None for every file.  The
+    // note's bytes are read into the entry like any other UNDEFINED
+    // value, and the plan does the position comparison from the entries.
+    match exifdata.maker_note_span(d)
+        Some(_) => test.fail("the doc says None for every file")
+        None    => test.assert(true)
+    match value_of(d, ExifIfdExif, exiftag.EXIF_TAG_MAKER_NOTE)
+        ExifBytes(data) => test.assert(bytes.len(data) == 8)
+        _               => test.fail("an UNDEFINED field is bytes")
+
+    let p = exifwrite.plan(chain, d, ExifContainerTiff)!
+    test.assert(p.keeps_thumbnail)
+    test.assert(p.has_maker_note)
+    test.assert(not p.maker_note_moves)
+    test.assert(list.len(p.dropped) == 0)
+    test.assert(p.fits)
+    test.assert(exifwrite.is_lossless(p))
+
+    test.case("and the write really is byte-identical")
+    let rebuilt = exifwrite.write(chain, d, ExifContainerTiff)!
+    test.assert(same_bytes(rebuilt, chain))
+
+@test
+fn test_a_write_that_moves_the_maker_note_says_so() [io]
+    // The whole reason this package has a plan: several vendors wrote
+    // absolute file offsets inside the note, so moving it loses the
+    // lens data and the focus points with no error anywhere.
+    let chain = chain_fixture(false)
+    var d = ok_data(chain)
+    test.assert(not exifwrite.plan(chain, d, ExifContainerTiff)!.maker_note_moves)
+
+    test.case("an entry added before the note in the value region moves it")
+    d = exifdata.set(d, ExifIfdExif, 0x9003, exifvalue.ascii_value("2026:10:11 00:00:00"))
+    let p = exifwrite.plan(chain, d, ExifContainerTiff)!
+    test.assert(p.has_maker_note)
+    test.assert(p.maker_note_moves)
+    test.assert(not exifwrite.is_lossless(p))
+    test.assert(p.keeps_thumbnail)
+
+    test.case("and the rewrite still carries the note's bytes")
+    let out = exifwrite.write(chain, d, ExifContainerTiff)!
+    let back = ok_data(out)
+    match exifdata.value(back, ExifIfdExif, exiftag.EXIF_TAG_MAKER_NOTE)
+        Some(v) =>
+            match v
+                ExifBytes(data) => test.assert(bytes.len(data) == 8)
+                _               => test.fail("an UNDEFINED field is bytes")
+        None    => test.fail("the note is still there")
+
+    test.case("a file with no note at all is not warned about")
+    let plain = fixture(ExifLittleEndian)
+    let q = exifwrite.plan(plain, ok_data(plain), ExifContainerJpeg)!
+    test.assert(not q.has_maker_note)
+    test.assert(not q.maker_note_moves)
+
+@test
+fn test_a_strip_tag_is_dropped_and_reported() [io]
+    // StripOffsets names image data at an offset relative to the TIFF
+    // header.  The rebuilt structure no longer has that data beside
+    // it, so the entry is dropped and the plan says which one.
+    let chain = chain_fixture(true)
+    let d = ok_data(chain)
+
+    test.case("the entry is read like any other")
+    test.assert(exifvalue.first_int(value_of(d, ExifIfdPrimary, 0x0111)) == Some(106))
+
+    let p = exifwrite.plan(chain, d, ExifContainerTiff)!
+    test.case("and the plan names it, with the directory it was in")
+    test.assert(list.len(p.dropped) == 1)
+    // Bound first rather than read off the call: a tuple field read
+    // directly off `list.get` generates a pointer where an Int is
+    // expected, which the LLVM backend refuses — the filing is
+    // codegen-llvm/a-tuple-field-read-off-a-call-expression-generates-a-pointer.
+    let first_drop = list.get(p.dropped, 0)
+    test.assert(first_drop.0 == 0)
+    test.assert(first_drop.1 == 0x0111)
+    test.assert(not exifwrite.is_lossless(p))
+
+    test.case("the thumbnail survives the drop, at its new offset")
+    test.assert(p.keeps_thumbnail)
+    let out = exifwrite.write(chain, d, ExifContainerTiff)!
+    let back = ok_data(out)
+    match exifdata.thumbnail_bytes(back, out)
+        Some(t) => test.assert(same_bytes(t, thumbnail_four_bytes()))
+        None    => test.fail("the thumbnail was carried over")
+    test.assert(exifdata.has_ifd(back, ExifIfdPrimary))
+    test.assert(not exifdata.has_ifd(back, ExifIfdGps))
+
+// ── the thumbnail and the MakerNote across containers ────────────────
+
+@test
+fn test_a_thumbnail_travels_with_the_metadata_across_containers() [io]
+    let chain = chain_fixture(false)
+    let d = ok_data(chain)
+
+    test.case("a thumbnail in a JPEG is a span into the file, container and all")
+    let jpeg = jpeg_with(chain)
+    let dj = ok_data(jpeg)
+    match exifdata.thumbnail_span(dj)
+        Some(s) =>
+            test.assert(s.length == 4)
+            test.assert(s.start == 12 + 118)
+        None    => test.fail("the thumbnail is there")
+    match exifdata.thumbnail_bytes(dj, jpeg)
+        Some(t) => test.assert(same_bytes(t, thumbnail_four_bytes()))
+        None    => test.fail("the bytes are in the JPEG")
+
+    test.case("the MakerNote rides along, and has no span of its own")
+    // A gap in the interface rather than a decision: `ExifEntry` does
+    // not record where a value sat, so there is no span to answer.
+    match exifdata.maker_note_span(dj)
+        Some(_) => test.fail("the doc says None for every file")
+        None    => test.assert(true)
+    match value_of(dj, ExifIfdExif, exiftag.EXIF_TAG_MAKER_NOTE)
+        ExifBytes(data) => test.assert(bytes.len(data) == 8)
+        _               => test.fail("an UNDEFINED field is bytes")
+
+    test.case("and writing it into the JPEG keeps both byte for byte")
+    let out = exifwrite.write(jpeg, dj, ExifContainerJpeg)!
+    test.assert(same_bytes(out, jpeg))
+
+    test.case("a PNG carries the same thumbnail")
+    let png = png_with(chain)
+    let dp = ok_data(png)
+    match exifdata.thumbnail_bytes(dp, png)
+        Some(t) => test.assert(same_bytes(t, thumbnail_four_bytes()))
+        None    => test.fail("the thumbnail is in the PNG")
+    test.assert(same_bytes(exifwrite.write(png, dp, ExifContainerPng)!, png))
+
+// ── every refusal ────────────────────────────────────────────────────
+//
+// The refusal is a caller's whole explanation of what went wrong: a
+// stable code for a log, a sentence for a person and the byte it is
+// about.  Every arm the interface declares is asked for all four, and
+// the count of the fatal ones is asserted too — the predicate that
+// decides whether a photograph is read at all.
+
+// One value of every fault arm the enum declares.  A new arm added to
+// the enum without a line here is a code, a message or a position
+// nothing tests.
+fn all_faults() -> [ExifFault]
+    var out: [ExifFault] = []
+    list.push(out, ExifNoExif)
+    list.push(out, ExifUnknownContainer)
+    list.push(out, ExifBadByteOrder(0, 0x4D49))
+    list.push(out, ExifBadMagic(2, 41))
+    list.push(out, ExifDirectoryTruncated(8, 4, 12))
+    list.push(out, ExifOffsetOutOfRange(34, 0x011A, 4000, 114))
+    list.push(out, ExifUnknownType(34, 0x011A, 99))
+    list.push(out, ExifTypeMismatch(22, 0x0112, 4, 3))
+    list.push(out, ExifCountMismatch(22, 0x0112, 2, 1))
+    list.push(out, ExifZeroDenominator(64, 0x829A))
+    list.push(out, ExifDirectoryLoop(8))
+    list.push(out, ExifTooManyDirectories(1))
+    list.push(out, ExifWrongTypeForTag(0x0112, 4, 3))
+    list.push(out, ExifSegmentTooLarge(65540, 65533))
+    list.push(out, ExifContainerCannotCarry)
+    out
+
+// Every code, in the order the arms are declared, joined by commas: one
+// string to compare against, so a code that changes spelling is caught.
+fn fault_codes() -> Str
+    var out = ""
+    for f in all_faults()
+        if str.len(out) > 0
+            out = out + ","
+        out = out + exiffault.code(f)
+    out
+
+// How many of the arms spoil the whole file rather than one entry.
+fn fatal_count() -> Int
+    var n = 0
+    for f in all_faults()
+        if exiffault.is_fatal(f)
+            n = n + 1
+    n
+
+@test
+fn test_every_refusal_has_a_code_a_message_and_a_position() [io]
+    test.case("every arm answers a code, a sentence and a position")
+    for f in all_faults()
+        test.assert(str.len(exiffault.code(f)) > 0)
+        test.assert(str.len(f.message()) > 0)
+        test.assert(exiffault.offset_of(f) >= 0 - 1)
+        test.assert(exiffault.tag_of(f) >= 0 - 1)
+
+    test.case("the codes are the stable spellings, one per arm")
+    test.assert(fault_codes() == "no_exif,unknown_container,bad_byte_order,bad_magic,directory_truncated,offset_out_of_range,unknown_type,type_mismatch,count_mismatch,zero_denominator,directory_loop,too_many_directories,wrong_type_for_tag,segment_too_large,container_cannot_carry")
+
+    test.case("the messages name the numbers a caller needs")
+    let no_magic = ExifBadMagic(2, 41)
+    test.assert(no_magic.message() == "the TIFF magic number at offset 2 is 41, not 42")
+    let zero_over = ExifZeroDenominator(64, 0x829A)
+    test.assert(zero_over.message()
+        == "tag 33434 at offset 64 is a rational with a zero denominator")
+    let many_dirs = ExifTooManyDirectories(1)
+    test.assert(many_dirs.message() == "more than 1 directories")
+    let wrong_type = ExifWrongTypeForTag(0x0112, 4, 3)
+    test.assert(wrong_type.message()
+        == "tag 274 was given a value of type 4; the tag table says 3")
+    let too_big = ExifSegmentTooLarge(65540, 65533)
+    test.assert(too_big.message()
+        == "the EXIF segment would need 65540 bytes; a JPEG APP1 segment holds 65533")
+    let nowhere = ExifContainerCannotCarry
+    test.assert(nowhere.message() == "this container has nowhere to put a TIFF structure")
+    let unknown_type = ExifUnknownType(34, 0x011A, 99)
+    test.assert(unknown_type.message()
+        == "tag 282 at offset 34 declares type code 99, which is not one of the twelve TIFF 6.0 defines")
+
+    test.case("a position is the offset the fault is about, or -1")
+    test.assert(exiffault.offset_of(ExifBadByteOrder(12, 0x4D49)) == 12)
+    test.assert(exiffault.offset_of(ExifDirectoryLoop(8)) == 8)
+    test.assert(exiffault.offset_of(ExifContainerCannotCarry) == 0 - 1)
+    test.assert(exiffault.offset_of(ExifSegmentTooLarge(65540, 65533)) == 0 - 1)
+    test.assert(exiffault.tag_of(ExifZeroDenominator(64, 0x829A)) == 0x829A)
+    test.assert(exiffault.tag_of(ExifUnknownType(34, 0x011A, 99)) == 0x011A)
+    test.assert(exiffault.tag_of(ExifWrongTypeForTag(0x0112, 4, 3)) == 0x0112)
+    test.assert(exiffault.tag_of(ExifNoExif) == 0 - 1)
+    test.assert(exiffault.tag_of(ExifBadMagic(2, 41)) == 0 - 1)
+
+    test.case("exactly the five that stop the walk are fatal")
+    // Without a byte order, a magic number or an entry count a reader
+    // cannot take a step at all, and a chain that loops or never ends
+    // is a reader that does not terminate.  Everything else spoils one
+    // entry and is carried as a finding.
+    test.assert(fatal_count() == 5)
+    test.assert(exiffault.is_fatal(ExifBadByteOrder(0, 0x4D49)))
+    test.assert(exiffault.is_fatal(ExifBadMagic(2, 41)))
+    test.assert(exiffault.is_fatal(ExifDirectoryTruncated(8, 4, 12)))
+    test.assert(exiffault.is_fatal(ExifDirectoryLoop(8)))
+    test.assert(exiffault.is_fatal(ExifTooManyDirectories(1)))
+    test.assert(not exiffault.is_fatal(ExifUnknownType(34, 0x011A, 99)))
+    test.assert(not exiffault.is_fatal(ExifTypeMismatch(22, 0x0112, 4, 3)))
+    test.assert(not exiffault.is_fatal(ExifCountMismatch(22, 0x0112, 2, 1)))
+    test.assert(not exiffault.is_fatal(ExifZeroDenominator(64, 0x829A)))
+    test.assert(not exiffault.is_fatal(ExifNoExif))
+
+// ── the twelve types, and every arm of a value ───────────────────────
+
+// The twelve types in the specification's order.
+fn all_types() -> [ExifType]
+    var out: [ExifType] = []
+    list.push(out, ExifTypeByte)
+    list.push(out, ExifTypeAscii)
+    list.push(out, ExifTypeShort)
+    list.push(out, ExifTypeLong)
+    list.push(out, ExifTypeRational)
+    list.push(out, ExifTypeSbyte)
+    list.push(out, ExifTypeUndefined)
+    list.push(out, ExifTypeSshort)
+    list.push(out, ExifTypeSlong)
+    list.push(out, ExifTypeSrational)
+    list.push(out, ExifTypeFloat)
+    list.push(out, ExifTypeDouble)
+    out
+
+@test
+fn test_every_type_arm_is_named_sized_and_coded() [io]
+    // A type is three things the file cares about: the code in the
+    // entry's type field, the size one element occupies and the name a
+    // person reads in a dump.  The twelve are walked once and every
+    // answer is asserted, so a table with a wrong element cannot hide
+    // behind the four types a camera actually writes.
+    let types = all_types()
+    test.case("the codes are 1 to 12, in the specification's order")
+    var code = 0
+    for t in types
+        code = code + 1
+        test.assert(exifvalue.type_code(t) == code)
+
+    test.case("and each code comes back as the type it names")
+    for t in types
+        match exifvalue.type_from_code(exifvalue.type_code(t))
+            Some(back) => test.assert(exifvalue.type_code(back) == exifvalue.type_code(t))
+            None       => test.fail("every code 1 to 12 is a type")
+
+    test.case("every size is the bytes one element occupies")
+    test.assert(exifvalue.type_size(ExifTypeByte) == 1)
+    test.assert(exifvalue.type_size(ExifTypeAscii) == 1)
+    test.assert(exifvalue.type_size(ExifTypeShort) == 2)
+    test.assert(exifvalue.type_size(ExifTypeLong) == 4)
+    test.assert(exifvalue.type_size(ExifTypeRational) == 8)
+    test.assert(exifvalue.type_size(ExifTypeSbyte) == 1)
+    test.assert(exifvalue.type_size(ExifTypeUndefined) == 1)
+    test.assert(exifvalue.type_size(ExifTypeSshort) == 2)
+    test.assert(exifvalue.type_size(ExifTypeSlong) == 4)
+    test.assert(exifvalue.type_size(ExifTypeSrational) == 8)
+    test.assert(exifvalue.type_size(ExifTypeFloat) == 4)
+    test.assert(exifvalue.type_size(ExifTypeDouble) == 8)
+
+    test.case("every name is the specification's own spelling")
+    test.assert(exifvalue.type_name(ExifTypeByte) == "BYTE")
+    test.assert(exifvalue.type_name(ExifTypeAscii) == "ASCII")
+    test.assert(exifvalue.type_name(ExifTypeShort) == "SHORT")
+    test.assert(exifvalue.type_name(ExifTypeLong) == "LONG")
+    test.assert(exifvalue.type_name(ExifTypeRational) == "RATIONAL")
+    test.assert(exifvalue.type_name(ExifTypeSbyte) == "SBYTE")
+    test.assert(exifvalue.type_name(ExifTypeUndefined) == "UNDEFINED")
+    test.assert(exifvalue.type_name(ExifTypeSshort) == "SSHORT")
+    test.assert(exifvalue.type_name(ExifTypeSlong) == "SLONG")
+    test.assert(exifvalue.type_name(ExifTypeSrational) == "SRATIONAL")
+    test.assert(exifvalue.type_name(ExifTypeFloat) == "FLOAT")
+    test.assert(exifvalue.type_name(ExifTypeDouble) == "DOUBLE")
+
+@test
+fn test_every_value_arm_knows_its_type_count_and_width() [io]
+    test.case("each arm answers the type code a file would declare")
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifBytes(bytes.zeros(0)))) == 1)
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifAscii(bytes.from_str("a")))) == 2)
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifShorts([1]))) == 3)
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifLongs([1]))) == 4)
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifRationals([]))) == 5)
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifSigneds([1]))) == 9)
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifSrationals([]))) == 10)
+    test.assert(exifvalue.type_code(exifvalue.type_of(ExifFloats([1.0]))) == 11)
+
+    test.case("a signed list is a SLONG by its arm, whatever the file declared")
+    // The declared code, not the arm, is what an entry keeps: SBYTE and
+    // SSHORT share the one signed arm, and a write puts back the code
+    // the entry carries.
+    test.assert(exifvalue.type_name(exifvalue.type_of(ExifSigneds([0 - 1]))) == "SLONG")
+    test.assert(exifvalue.type_name(exifvalue.type_of(ExifBytes(bytes.zeros(0)))) == "BYTE")
+
+    test.case("the count is the number of elements, and an empty list has none")
+    test.assert(exifvalue.count_of(ExifAscii(bytes.from_str("abcd"))) == 4)
+    test.assert(exifvalue.count_of(ExifBytes(bytes.zeros(2))) == 2)
+    test.assert(exifvalue.count_of(ExifFloats([1.0, 2.0])) == 2)
+    test.assert(exifvalue.count_of(ExifRationals([])) == 0)
+    test.assert(exifvalue.count_of(ExifSrationals([])) == 0)
+
+    test.case("the width is the count times the size of one element")
+    test.assert(exifvalue.byte_length(ExifBytes(bytes.zeros(2))) == 2)
+    test.assert(exifvalue.byte_length(ExifAscii(bytes.from_str("abcd"))) == 4)
+    test.assert(exifvalue.byte_length(ExifLongs([1])) == 4)
+    test.assert(exifvalue.byte_length(ExifSigneds([1])) == 4)
+    test.assert(exifvalue.byte_length(ExifFloats([1.0])) == 4)
+    test.assert(exifvalue.byte_length(ExifSrationals([ExifSrational { numerator: 1, denominator: 1 }])) == 8)
+    test.assert(exifvalue.byte_length(ExifRationals([])) == 0)
+
+    test.case("four bytes or fewer fits the entry's inline field")
+    test.assert(exifvalue.fits_inline(ExifAscii(bytes.from_str("abcd"))))
+    test.assert(exifvalue.fits_inline(ExifFloats([1.0])))
+    test.assert(exifvalue.fits_inline(ExifRationals([])))
+    test.assert(exifvalue.fits_inline(ExifLongs([1])))
+    test.assert(not exifvalue.fits_inline(ExifAscii(bytes.from_str("abcde"))))
+    test.assert(not exifvalue.fits_inline(ExifFloats([1.0, 2.0])))
+    test.assert(not exifvalue.fits_inline(ExifRationals([ExifRational { numerator: 1, denominator: 2 }])))
+    test.assert(not exifvalue.fits_inline(ExifSrationals([ExifSrational { numerator: 1, denominator: 2 }])))
+
+    test.case("the first integer is asked for, and only the integer arms answer")
+    match exifvalue.first_int(ExifLongs([7, 8]))
+        Some(n) => test.assert(n == 7)
+        None    => test.fail("a LONG list has a first element")
+    match exifvalue.first_int(ExifSigneds([0 - 9]))
+        Some(n) => test.assert(n == 0 - 9)
+        None    => test.fail("a signed list has a first element")
+    match exifvalue.first_int(ExifSigneds([]))
+        None    => test.assert(true)
+        Some(_) => test.fail("an empty list has none")
+    match exifvalue.first_int(ExifBytes(bytes.zeros(2)))
+        None    => test.assert(true)
+        Some(_) => test.fail("BYTE is not one of the integer arms")
+    match exifvalue.first_int(ExifAscii(bytes.from_str("1")))
+        None    => test.assert(true)
+        Some(_) => test.fail("ASCII is not one of the integer arms")
+    match exifvalue.first_int(ExifFloats([1.0]))
+        None    => test.assert(true)
+        Some(_) => test.fail("a FLOAT is not an integer arm")
+
+    test.case("the first rational belongs to the two rational arms and no others")
+    match exifvalue.first_ratio(ExifSrationals([ExifSrational { numerator: 1, denominator: 2 }]))
+        None    => test.assert(true)
+        Some(_) => test.fail("SRATIONAL has its own arm, and first_ratio is RATIONAL's")
+    match exifvalue.first_ratio(ExifRationals([]))
+        None    => test.assert(true)
+        Some(_) => test.fail("an empty list has none")
+    match exifvalue.first_ratio(ExifLongs([1]))
+        None    => test.assert(true)
+        Some(_) => test.fail("a LONG is not a RATIONAL")
+
+    test.case("an ASCII field with no bytes at all is the empty string")
+    test.assert(exifvalue.ascii_text(ExifAscii(bytes.zeros(0))) == "")
+    test.assert(exifvalue.count_of(exifvalue.ascii_value("")) == 1)
+
+    test.case("asking for the text of something that is not ASCII is a panic")
+    test.assert_raises(() => exifvalue.ascii_text(ExifShorts([1])))
+    test.assert_raises(() => exifvalue.ascii_text(ExifBytes(bytes.zeros(1))))
+
+// ── the numbers a decimal cannot hold ────────────────────────────────
+
+@test
+fn test_the_float_and_rational_corners_are_named_rather_than_guessed() [io]
+    test.case("a negative numerator is a negative float")
+    match exifvalue.to_float(ExifRational { numerator: 0 - 1, denominator: 4 })
+        Ok(f)  => test.assert(f == 0.0 - 0.25)
+        Err(e) => test.fail(e.message())
+
+    test.case("a zero denominator is refused by name, in both rational forms")
+    match exifvalue.srational_to_float(ExifSrational { numerator: 1, denominator: 0 })
+        Ok(_)  => test.fail("1/0 is not a number")
+        Err(e) => test.assert(exiffault.code(e) == "zero_denominator")
+    match exifvalue.srational_to_float(ExifSrational { numerator: 0 - 1, denominator: 0 })
+        Ok(_)  => test.fail("a sign does not make a zero denominator a number")
+        Err(e) => test.assert(exiffault.code(e) == "zero_denominator")
+
+    test.case("a negative decimal becomes a negative fraction")
+    let half = exifvalue.ratio_from_float(0.0 - 0.5, 1000)
+    test.assert(half.numerator == 0 - 1)
+    test.assert(half.denominator == 2)
+
+    test.case("a not-a-number becomes the 0/0 a caller can see and refuse")
+    let nan = exifvalue.ratio_from_float(math.nan(), 1000)
+    test.assert(nan.numerator == 0)
+    test.assert(nan.denominator == 0)
+    match exifvalue.to_float(nan)
+        Ok(_)  => test.fail("0/0 is not a number")
+        Err(e) => test.assert(exiffault.code(e) == "zero_denominator")
+
+    test.case("an infinity becomes the over-zero spelling a file can hold")
+    let up = exifvalue.ratio_from_float(math.infinity(), 1000)
+    test.assert(up.numerator == 1)
+    test.assert(up.denominator == 0)
+    let down = exifvalue.ratio_from_float(0.0 - math.infinity(), 1000)
+    test.assert(down.numerator == 0 - 1)
+    test.assert(down.denominator == 0)
+
+    test.case("a ceiling below one is raised to one, since a denominator is positive")
+    let floored = exifvalue.ratio_from_float(0.4, 0)
+    test.assert(floored.denominator == 1)
+    test.assert(floored.numerator == 0)
+
+    test.case("a ceiling no field could hold is clamped to the field's own")
+    let wide = exifvalue.ratio_from_float(0.25, 99999999999)
+    test.assert(wide.numerator == 1)
+    test.assert(wide.denominator == 4)
+
+    test.case("a number too large for the field is written as the field's largest")
+    let huge = exifvalue.ratio_from_float(math.pow(10.0, 12.0), 4294967295)
+    test.assert(huge.numerator == 4294967295)
+    test.assert(huge.denominator == 1)
+
+    test.case("a convergent whose numerator would pass the field stops a step short")
+    // 4294967294.5 is 4294967294 + 1/2, so the next convergent is
+    // 8589934589/2: its denominator is inside the field and its
+    // numerator is not, and the step before it is the answer.  The
+    // numerator ceiling is the 32 bits a RATIONAL stores, which a
+    // continued fraction reaches long before its denominator does.
+    let root = exifvalue.ratio_from_float(4294967294.5, 4294967295)
+    test.assert(root.numerator == 4294967294)
+    test.assert(root.denominator == 1)
+
+// ── the GPS and the date accessors ───────────────────────────────────
+
+// A degrees/minutes/seconds triple as a GPS tag holds one: three
+// RATIONALs, each a whole number of units.
+fn dms_value(deg: Int, min: Int, sec: Int) -> ExifValue
+    var rs: [ExifRational] = []
+    list.push(rs, ExifRational { numerator: deg, denominator: 1 })
+    list.push(rs, ExifRational { numerator: min, denominator: 1 })
+    list.push(rs, ExifRational { numerator: sec, denominator: 1 })
+    ExifRationals(rs)
+
+// The same block with one more GPS entry.
+fn with_gps(d: ExifData, tag: Int, v: ExifValue) -> ExifData
+    exifdata.set(d, ExifIfdGps, tag, v)
+
+@test
+fn test_the_gps_accessor_is_four_tags_and_two_sign_conventions() [io]
+    // The sign is in a SEPARATE tag, and a reader that takes the
+    // degrees and not the reference puts every southern photograph in
+    // the northern hemisphere.
+    test.case("a southern, western position is negative in both halves")
+    var d = exifdata.empty(ExifLittleEndian)
+    d = with_gps(d, 0x0001, exifvalue.ascii_value("S"))
+    d = with_gps(d, 0x0002, dms_value(51, 30, 0))
+    d = with_gps(d, 0x0003, exifvalue.ascii_value("W"))
+    d = with_gps(d, 0x0004, dms_value(0, 30, 0))
+    match exifdata.gps_degrees(d)
+        Ok(p)    =>
+            match p
+                Some(ll) =>
+                    test.assert(math.abs(ll.0 - (0.0 - 51.5)) < 0.000001)
+                    test.assert(math.abs(ll.1 - (0.0 - 0.5)) < 0.000001)
+                None     => test.fail("both triples are there")
+        Err(err) => test.fail(err.message())
+
+    test.case("no reference tag at all leaves both halves positive")
+    var absent = exifdata.empty(ExifLittleEndian)
+    absent = with_gps(absent, 0x0002, dms_value(10, 0, 0))
+    absent = with_gps(absent, 0x0004, dms_value(20, 30, 0))
+    match exifdata.gps_degrees(absent)
+        Ok(p)    =>
+            match p
+                Some(ll) =>
+                    test.assert(ll.0 == 10.0)
+                    test.assert(ll.1 == 20.5)
+                None     => test.fail("both triples are there")
+        Err(err) => test.fail(err.message())
+
+    test.case("N and E are the two positive labels")
+    var east = exifdata.empty(ExifLittleEndian)
+    east = with_gps(east, 0x0001, exifvalue.ascii_value("N"))
+    east = with_gps(east, 0x0002, dms_value(1, 0, 0))
+    east = with_gps(east, 0x0003, exifvalue.ascii_value("E"))
+    east = with_gps(east, 0x0004, dms_value(2, 0, 0))
+    match exifdata.gps_degrees(east)
+        Ok(p)    =>
+            match p
+                Some(ll) =>
+                    test.assert(ll.0 == 1.0)
+                    test.assert(ll.1 == 2.0)
+                None     => test.fail("both triples are there")
+        Err(err) => test.fail(err.message())
+
+    test.case("a triple shorter than three rationals is no position")
+    var thin_rs: [ExifRational] = []
+    list.push(thin_rs, ExifRational { numerator: 1, denominator: 1 })
+    let thin = with_gps(exifdata.empty(ExifLittleEndian), 0x0002, ExifRationals(thin_rs))
+    match exifdata.gps_degrees(thin)
+        Ok(p)    =>
+            match p
+                None    => test.assert(true)
+                Some(_) => test.fail("one rational is not a triple")
+        Err(err) => test.fail(err.message())
+
+    test.case("a latitude with no longitude is no position rather than half of one")
+    let half = with_gps(exifdata.empty(ExifLittleEndian), 0x0002, dms_value(10, 0, 0))
+    match exifdata.gps_degrees(half)
+        Ok(p)    =>
+            match p
+                None    => test.assert(true)
+                Some(_) => test.fail("half a position is not a position")
+        Err(err) => test.fail(err.message())
+
+    test.case("a GPS tag that is not a rational triple is no position either")
+    let wrong = with_gps(exifdata.empty(ExifLittleEndian), 0x0002, ExifShorts([51]))
+    match exifdata.gps_degrees(wrong)
+        Ok(p)    =>
+            match p
+                None    => test.assert(true)
+                Some(_) => test.fail("a SHORT is not a triple")
+        Err(err) => test.fail(err.message())
+
+    test.case("51 over zero degrees is a refusal and not an infinity")
+    var bad_rs: [ExifRational] = []
+    list.push(bad_rs, ExifRational { numerator: 51, denominator: 0 })
+    list.push(bad_rs, ExifRational { numerator: 0, denominator: 1 })
+    list.push(bad_rs, ExifRational { numerator: 0, denominator: 1 })
+    let bad = with_gps(exifdata.empty(ExifLittleEndian), 0x0002, ExifRationals(bad_rs))
+    match exifdata.gps_degrees(bad)
+        Ok(_)    => test.fail("51/0 is not a number of degrees")
+        Err(err) => test.assert(exiffault.code(err) == "zero_denominator")
+
+@test
+fn test_a_date_is_the_six_numbers_the_field_carries() [io]
+    // NOT AN INSTANT: EXIF writes the field with no time zone, so the
+    // six numbers are all the file said.  A field that is not exactly
+    // that shape is not a date rather than a zeroed tuple a caller
+    // would print as one.
+    let d = exifdata.set(exifdata.empty(ExifLittleEndian), ExifIfdExif, 0x9003,
+                         exifvalue.ascii_value("2026:10:11 13:45:59"))
+
+    test.case("the six numbers come back in the field's own order")
+    match exifdata.date_fields(d, ExifIfdExif, 0x9003)
+        Some(t) =>
+            test.assert(t.0 == 2026)
+            test.assert(t.1 == 10)
+            test.assert(t.2 == 11)
+            test.assert(t.3 == 13)
+            test.assert(t.4 == 45)
+            test.assert(t.5 == 59)
+        None    => test.fail("that is a date")
+
+    test.case("a field shorter than nineteen bytes is not a date")
+    let shorter = exifdata.set(d, ExifIfdExif, 0x9003, exifvalue.ascii_value("2026:10:11"))
+    match exifdata.date_fields(shorter, ExifIfdExif, 0x9003)
+        None    => test.assert(true)
+        Some(_) => test.fail("eleven bytes is not a date")
+
+    test.case("and one whose digits are not digits is not a date either")
+    let junk = exifdata.set(d, ExifIfdExif, 0x9003, exifvalue.ascii_value("yyyy:mm:dd hh:mm:ss"))
+    match exifdata.date_fields(junk, ExifIfdExif, 0x9003)
+        None    => test.assert(true)
+        Some(_) => test.fail("that is not a date")
+
+    test.case("nor is one whose time of day is not a time of day")
+    // The date half parses and the time half does not, which is the
+    // other side of the same check: a field is a date or it is not.
+    let late = exifdata.set(d, ExifIfdExif, 0x9003, exifvalue.ascii_value("2026:10:11 13:4x:59"))
+    match exifdata.date_fields(late, ExifIfdExif, 0x9003)
+        None    => test.assert(true)
+        Some(_) => test.fail("that is not a time of day")
+
+    test.case("a value that is not ASCII is not a date")
+    let counted = exifdata.set(d, ExifIfdExif, 0x9003, ExifShorts([1]))
+    match exifdata.date_fields(counted, ExifIfdExif, 0x9003)
+        None    => test.assert(true)
+        Some(_) => test.fail("a SHORT is not a date field")
+
+    test.case("and a tag the block does not carry is not a date")
+    match exifdata.date_fields(exifdata.empty(ExifLittleEndian), ExifIfdExif, 0x9003)
+        None    => test.assert(true)
+        Some(_) => test.fail("there is no such tag")
+
+// ── what the accessors answer when there is nothing there ────────────
+
+@test
+fn test_the_metadata_accessors_answer_none_rather_than_guessing() [io]
+    let none = exifdata.empty(ExifLittleEndian)
+    let d = ok_data(fixture(ExifLittleEndian))
+
+    test.case("a tag that is not there answers None from both accessors")
+    match exifdata.entry(d, ExifIfdPrimary, 0x010F)
+        None    => test.assert(true)
+        Some(_) => test.fail("the fixture carries no Make")
+    match exifdata.value(d, ExifIfdPrimary, 0x010F)
+        None    => test.assert(true)
+        Some(_) => test.fail("the fixture carries no Make")
+    test.assert(not exifdata.has_ifd(d, ExifIfdGps))
+
+    test.case("an orientation tag that is not an integer still reads upright")
+    // A tag that is present but is not an integer is not a refusal
+    // either: 1 is upright, which is what every viewer falls back to.
+    let text = exifdata.set(none, ExifIfdPrimary, 0x0112, exifvalue.ascii_value("6"))
+    test.assert(exifdata.has_orientation(text))
+    test.assert(exiforient.tag_value(exifdata.orientation(text)) == 1)
+
+    test.case("and a block with no orientation tag at all is upright")
+    test.assert(not exifdata.has_orientation(none))
+    test.assert(exiforient.tag_value(exifdata.orientation(none)) == 1)
+
+    test.case("with_orientation sets the tag the orientation accessor reads")
+    let turned = exifdata.with_orientation(none, ExifRotate270)
+    test.assert(exifdata.has_orientation(turned))
+    test.assert(exiforient.tag_value(exifdata.orientation(turned)) == 8)
+    let back = exifdata.with_orientation(turned, ExifUpright)
+    test.assert(exifdata.entry_count(back) == exifdata.entry_count(turned))
+    test.assert(exiforient.tag_value(exifdata.orientation(back)) == 1)
+
+    test.case("set replaces the tag rather than appending a second entry")
+    let one = exifdata.set(none, ExifIfdPrimary, 0x0112, ExifShorts([6]))
+    test.assert(exifdata.entry_count(one) == 1)
+    let twice = exifdata.set(one, ExifIfdPrimary, 0x0112, ExifShorts([8]))
+    test.assert(exifdata.entry_count(twice) == 1)
+    test.assert(exiforient.tag_value(exifdata.orientation(twice)) == 8)
+
+    test.case("remove drops exactly the entry it names")
+    test.assert(exifdata.entry_count(exifdata.remove(one, ExifIfdPrimary, 0x0112)) == 0)
+    test.assert(exifdata.entry_count(exifdata.remove(one, ExifIfdPrimary, 0x0113)) == 1)
+
+    test.case("an empty block answers nothing to every accessor")
+    test.assert(exifdata.entry_count(none) == 0)
+    test.assert(list.len(exifdata.entries_in(none, ExifIfdPrimary)) == 0)
+    match exifdata.entry(none, ExifIfdPrimary, 0x0112)
+        None    => test.assert(true)
+        Some(_) => test.fail("an empty block has no entries")
+    match exifdata.value(none, ExifIfdPrimary, 0x0112)
+        None    => test.assert(true)
+        Some(_) => test.fail("an empty block has no entries")
+    match exifdata.thumbnail_span(none)
+        None    => test.assert(true)
+        Some(_) => test.fail("an empty block has no thumbnail")
+    match exifdata.thumbnail_bytes(none, bytes.zeros(8))
+        None    => test.assert(true)
+        Some(_) => test.fail("an empty block has no thumbnail")
+    test.assert(not exifdata.thumbnail_is_jpeg(none))
+    match exifdata.maker_note_span(none)
+        None    => test.assert(true)
+        Some(_) => test.fail("the doc says None for every file")
+
+// ── the tag table ────────────────────────────────────────────────────
+
+@test
+fn test_the_tag_table_names_each_pointer_and_each_orientation() [io]
+    test.case("the three pointer tags name the directory behind them")
+    match exiftag.ifd_behind_pointer(exiftag.EXIF_TAG_EXIF_IFD)
+        Some(i) => test.assert(exiftag.ifd_name(i) == "Exif")
+        None    => test.fail("0x8769 points at the Exif IFD")
+    match exiftag.ifd_behind_pointer(exiftag.EXIF_TAG_GPS_IFD)
+        Some(i) => test.assert(i == ExifIfdGps)
+        None    => test.fail("0x8825 points at the GPS IFD")
+    match exiftag.ifd_behind_pointer(exiftag.EXIF_TAG_INTEROP_IFD)
+        Some(i) => test.assert(i == ExifIfdInterop)
+        None    => test.fail("0xA005 points at the interoperability IFD")
+    match exiftag.ifd_behind_pointer(0x0112)
+        None    => test.assert(true)
+        Some(_) => test.fail("the orientation tag is not a pointer")
+
+    test.case("every orientation has a name, and its own tag value round trips")
+    for o in all_orientations()
+        test.assert(str.len(exiforient.orientation_name(o)) > 0)
+        let tag = exiforient.tag_value(o)
+        test.assert(exiforient.tag_value(exiforient.from_tag_value(tag)) == tag)
+    test.assert(exiforient.orientation_name(ExifMirrorHRotate90) == "mirror-h-rotate-90")
+    test.assert(exiforient.orientation_name(ExifMirrorHRotate270) == "mirror-h-rotate-270")
+    test.assert(exiforient.tag_value(exiforient.from_tag_value(99)) == 1)
+
+    test.case("a number the table has no name for prints as four hex digits")
+    test.assert(exiftag.name_at(ExifIfdPrimary, 0x9999) == "0x9999")
+    // A tag number is sixteen bits.  A negative one — which a caller
+    // can pass, because the parameter is an `Int` — wraps rather than
+    // printing its sign.
+    test.assert(exiftag.name_at(ExifIfdPrimary, 0 - 1) == "0xffff")
+
+// ── a crafted file, byte by byte ─────────────────────────────────────
+
+// The first finding a report carries.  A report with none is a test's
+// own mistake rather than a case this package has to handle.
+fn first_finding(rep: ExifReport) -> ExifFault
+    if list.len(rep.findings) == 0
+        core.panic.panic("the file is supposed to have a finding")
+    list.get(rep.findings, 0)
+
+// The report a source gives, or a panic for the tests that expect one.
+fn report_of(source: Bytes) -> ExifReport
+    let found = exifread.read_report(source, exifread.default_options())!
+    match found
+        Some(rep) => rep
+        None      =>
+            core.panic.panic("the source carries metadata")
+
+// The refusal a source gives, or a panic for the tests that expect one.
+fn refusal_of(source: Bytes, o: ExifReadOptions) -> ExifFault
+    match exifread.read(source, o)
+        Ok(_)  =>
+            core.panic.panic("the source has to be refused")
+        Err(e) => e
+
+@test
+fn test_a_crafted_file_is_read_or_refused_with_what_was_wrong() [io]
+    // Each case is ONE mutation of the hand-built fixture: the reader
+    // either answers a finding about one entry and reads the rest, or
+    // refuses the whole file and names the byte it could not get past.
+    // A reader that refused the first kind would refuse a large share
+    // of the photographs in the world over a tag nobody asked for.
+    let o = ExifLittleEndian
+
+    test.case("a type code TIFF does not define is a finding, not a refusal")
+    var unknown_type = fixture(o)
+    put16(unknown_type, 36, 99, o)   // XResolution declares type 99
+    let ru = report_of(unknown_type)
+    test.assert(exifdata.finding_count(ru) == 1)
+    test.assert(exiffault.code(first_finding(ru)) == "unknown_type")
+    test.assert(exiffault.tag_of(first_finding(ru)) == 0x011A)
+    test.assert(exiffault.offset_of(first_finding(ru)) == 34)
+    test.assert(not exiffault.is_fatal(first_finding(ru)))
+    let reported = first_finding(ru)
+    match reported
+        ExifUnknownType(off, tag, code) =>
+            test.assert(off == 34)
+            test.assert(tag == 0x011A)
+            test.assert(code == 99)
+        _                               => test.fail("that is the unknown type")
+    // The entry is not stored and the other four are.
+    test.assert(exifdata.entry_count(ru.data) == 4)
+
+    test.case("an offset past the end of the block is a finding")
+    var far = fixture(o)
+    put32(far, 42, 4000, o)   // XResolution's value is at 4000
+    let rf = report_of(far)
+    test.assert(exiffault.code(first_finding(rf)) == "offset_out_of_range")
+    match first_finding(rf)
+        ExifOffsetOutOfRange(off, tag, pointed_at, limit) =>
+            test.assert(off == 34)
+            test.assert(tag == 0x011A)
+            test.assert(pointed_at == 4000)
+            test.assert(limit == 114)
+        _                                                 => test.fail("that is the offset out of range")
+    test.assert(exifdata.entry_count(rf.data) == 4)
+
+    test.case("a zero denominator is a finding, and the two integers still read")
+    var zero_den = fixture(o)
+    put32(zero_den, 110, 0, o)   // ExposureTime is 1/0
+    let rz = report_of(zero_den)
+    test.assert(exiffault.code(first_finding(rz)) == "zero_denominator")
+    test.assert(exiffault.tag_of(first_finding(rz)) == 0x829A)
+    let zr = first_ratio_in(rz.data, ExifIfdExif, 0x829A)
+    test.assert(zr.numerator == 1)
+    test.assert(zr.denominator == 0)
+    match exifvalue.to_float(zr)
+        Ok(_)  => test.fail("1/0 is not a number")
+        Err(e) => test.assert(exiffault.code(e) == "zero_denominator")
+
+    test.case("a declared type the tag table disagrees with is a finding")
+    var mismatched = fixture(o)
+    put16(mismatched, 24, 4, o)   // Orientation declared LONG
+    let rm = report_of(mismatched)
+    test.assert(exifdata.finding_count(rm) == 1)
+    match first_finding(rm)
+        ExifTypeMismatch(off, tag, declared, expected) =>
+            test.assert(off == 22)
+            test.assert(tag == 0x0112)
+            test.assert(declared == 4)
+            test.assert(expected == 3)
+        _                                              => test.fail("that is the type mismatch")
+    test.case("and the entry is still read, because the file said what it was")
+    test.assert(exiforient.tag_value(exifdata.orientation(rm.data)) == 6)
+
+    test.case("a declared count the tag table disagrees with is a finding too")
+    var counted = fixture(o)
+    put32(counted, 26, 2, o)   // Orientation carrying two values
+    let rc = report_of(counted)
+    match first_finding(rc)
+        ExifCountMismatch(off, tag, declared, expected) =>
+            test.assert(off == 22)
+            test.assert(tag == 0x0112)
+            test.assert(declared == 2)
+            test.assert(expected == 1)
+        _                                               => test.fail("that is the count mismatch")
+    test.assert(exiforient.tag_value(exifdata.orientation(rc.data)) == 6)
+
+    test.case("two things wrong at once are two findings and the rest reads")
+    var both = fixture(o)
+    put16(both, 36, 99, o)
+    put32(both, 26, 2, o)
+    let rb = report_of(both)
+    test.assert(exifdata.finding_count(rb) == 2)
+    test.assert(exifdata.entry_count(rb.data) == 4)
+    match exifdata.value(rb.data, ExifIfdExif, 0x9000)
+        Some(_) => test.assert(true)
+        None    => test.fail("the ExifVersion is not one of the two wrong entries")
+
+    test.case("a directory that runs past the end of the block is a refusal")
+    let short = bytes.slice(fixture(o), 0, 20)
+    match exifread.read(short, exifread.default_options())
+        Ok(_)  => test.fail("twenty bytes cannot hold four entries")
+        Err(e) =>
+            test.assert(exiffault.code(e) == "directory_truncated")
+            test.assert(exiffault.is_fatal(e))
+            test.assert(exiffault.offset_of(e) == 8)
+
+    test.case("a next-directory pointer that points back is a loop")
+    var looped = fixture(o)
+    put32(looped, 58, 8, o)   // the 0th IFD's next is the 0th IFD
+    let loop_fault = refusal_of(looped, exifread.default_options())
+    test.assert(exiffault.code(loop_fault) == "directory_loop")
+    test.assert(exiffault.is_fatal(loop_fault))
+    test.assert(exiffault.offset_of(loop_fault) == 8)
+
+    test.case("more directories than the options allow is a refusal")
+    let one_dir = exifread.with_max_directories(exifread.default_options(), 1)
+    let many_fault = refusal_of(fixture(o), one_dir)
+    test.assert(exiffault.code(many_fault) == "too_many_directories")
+    test.assert(exiffault.is_fatal(many_fault))
+    test.assert(exiffault.offset_of(many_fault) == 0 - 1)
+
+    test.case("more value bytes than the options allow is a refusal")
+    let tiny = exifread.with_max_value_bytes(exifread.default_options(), 4)
+    let byte_fault = refusal_of(fixture(o), tiny)
+    test.assert(exiffault.code(byte_fault) == "directory_truncated")
+    test.assert(exiffault.offset_of(byte_fault) == 8)
+
+    test.case("a byte-order mark that is neither II nor MM is a refusal")
+    let mi = bytes.from_byte_list([0x4D, 0x49, 0x2A, 0x00, 8, 0, 0, 0])
+    match exifread.read_tiff(mi, exifread.default_options())
+        Ok(_)  => test.fail("MI is not a byte order")
+        Err(e) =>
+            test.assert(exiffault.code(e) == "bad_byte_order")
+            test.assert(exiffault.is_fatal(e))
+            test.assert(exiffault.offset_of(e) == 0)
+            test.assert(e.message()
+                == "the byte-order mark at offset 0 is neither II nor MM; it is 19785")
+
+    test.case("a magic number that is not 42 is a refusal, by name")
+    var bad_magic = fixture(o)
+    put16(bad_magic, 2, 41, o)
+    match exifread.read_tiff(bad_magic, exifread.default_options())
+        Ok(_)  => test.fail("the magic is 42")
+        Err(e) =>
+            test.assert(exiffault.code(e) == "bad_magic")
+            test.assert(exiffault.is_fatal(e))
+            test.assert(exiffault.offset_of(e) == 2)
+
+    test.case("and sniffing refuses the same file as no container at all")
+    match exifread.read(bad_magic, exifread.default_options())
+        Ok(_)  => test.fail("a file with magic 41 sniffs as nothing")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+
+    test.case("bytes that are no container at all")
+    match exifread.read(bytes.zeros(0), exifread.default_options())
+        Ok(_)  => test.fail("there is nothing here")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+    match exifread.read_report(bytes.zeros(64), exifread.default_options())
+        Ok(_)  => test.fail("zeros sniff as no container either")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+
+    test.case("a header with no directory at all reads as no entries")
+    let header_only = bytes.from_byte_list([0x49, 0x49, 0x2A, 0x00])
+    let dh = ok_data(header_only)
+    test.assert(exifdata.entry_count(dh) == 0)
+    test.assert(finding_count_of(header_only) == 0)
+
+// ── the container walk ───────────────────────────────────────────────
+
+// Whether these bytes walk to no TIFF structure at all.
+fn no_offset(source: Bytes) -> Bool
+    match exifread.tiff_offset(source)
+        None    => true
+        Some(_) => false
+
+// Whether these bytes read as no metadata at all, with no refusal.
+fn reads_empty(source: Bytes) -> Bool
+    match exifread.read(source, exifread.default_options())
+        Ok(found) =>
+            match found
+                Some(_) => false
+                None    => true
+        Err(_)    => false
+
+@test
+fn test_the_container_walk_stops_where_it_cannot_follow() [io]
+    // A truncated segment ends the walk rather than refusing the file:
+    // a caller that has already decoded a photograph should not lose it
+    // to a tail.  The exceptions are the two named readers, which are
+    // told what they have and say so when they are wrong.
+    let fa = fixture(ExifLittleEndian)
+
+    test.case("the named readers refuse a container that is not theirs")
+    match exifread.read_jpeg(png_with(fa), exifread.default_options())
+        Ok(_)  => test.fail("that is a PNG")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+    match exifread.read_png(jpeg_with(fa), exifread.default_options())
+        Ok(_)  => test.fail("that is a JPEG")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+    match exifread.read_tiff(jpeg_with(fa), exifread.default_options())
+        Ok(_)  => test.fail("a JPEG is not a TIFF")
+        Err(e) => test.assert(exiffault.code(e) == "bad_byte_order")
+
+    test.case("and each reads its own")
+    let from_jpeg = exifread.read_jpeg(jpeg_with(fa), exifread.default_options())!
+    match from_jpeg
+        Some(x) => test.assert(exifdata.entry_count(x) == 5)
+        None    => test.fail("the segment is there")
+    let from_png = exifread.read_png(png_with(fa), exifread.default_options())!
+    match from_png
+        Some(x) => test.assert(exifdata.entry_count(x) == 5)
+        None    => test.fail("the chunk is there")
+    let from_report = exifread.read_report(jpeg_with(fa), exifread.default_options())!
+    match from_report
+        Some(r) => test.assert(exifdata.finding_count(r) == 0)
+        None    => test.fail("the segment is there")
+
+    test.case("a JPEG whose walk runs out of bytes stops rather than refusing")
+    // Two bytes of start-of-image and nothing behind them.
+    test.assert(no_offset(bytes.from_byte_list([0xFF, 0xD8])))
+    // A byte where a marker has to be.
+    test.assert(no_offset(bytes.from_byte_list([0xFF, 0xD8, 0x00, 0x00, 0x00, 0x00])))
+    // A standalone marker, then a segment whose length runs past the end.
+    test.assert(no_offset(bytes.from_byte_list([
+        0xFF, 0xD8, 0xFF, 0x01, 0xFF, 0xDB, 0x00, 0x04, 0x00, 0x43])))
+    // A length field below the two bytes it counts itself with.
+    test.assert(no_offset(bytes.from_byte_list([
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x01, 0x00, 0x00])))
+    // A segment longer than the file.
+    test.assert(no_offset(bytes.from_byte_list([
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x20, 0x00, 0x00])))
+    // The start of scan: everything behind it is entropy-coded, so the
+    // walk stops rather than reading compressed data as markers.
+    test.assert(no_offset(bytes.from_byte_list([
+        0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x04, 0x00, 0x00])))
+    // An APP1 segment with too few bytes behind it for `Exif\0\0`.
+    test.assert(no_offset(bytes.from_byte_list([
+        0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xD9])))
+    // An APP1 segment that is a JFIF one rather than an Exif one.
+    test.assert(no_offset(bytes.from_byte_list([
+        0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x0A, 0x4A, 0x46, 0x49, 0x46,
+        0x00, 0x00, 0x00, 0x00, 0xFF, 0xD9])))
+    test.assert(reads_empty(bytes.from_byte_list([0xFF, 0xD8, 0xFF, 0xDA,
+                                                  0x00, 0x04, 0x00, 0x00])))
+
+    test.case("and a PNG whose chunk walk does the same")
+    let png_exif = png_with(fa)
+    // The chunk header needs twelve bytes and the eXIf chunk's offset
+    // has fewer than that left in the file.
+    test.assert(no_offset(bytes.slice(png_exif, 0, 44)))
+    test.assert(reads_empty(bytes.slice(png_exif, 0, 44)))
+    // And a chunk whose declared length runs past the end of the file.
+    test.assert(no_offset(bytes.slice(png_exif, 0, 45)))
+    test.assert(reads_empty(bytes.slice(png_exif, 0, 45)))
+    // A PNG with no eXIf chunk at all.
+    test.assert(no_offset(png_bare()))
+    test.assert(reads_empty(png_bare()))
+
+    test.case("the orientation reads out of both byte orders and out of a JPEG")
+    test.assert(exiforient.tag_value(exifread.read_orientation(fixture(ExifBigEndian))) == 6)
+    test.assert(exiforient.tag_value(exifread.read_orientation(jpeg_with(fa))) == 6)
+    test.assert(exiforient.tag_value(exifread.read_orientation(bytes.slice(fa, 0, 20))) == 1)
+
+    test.case("and a block the narrow reader cannot get a header out of is upright")
+    let mis_marked = bytes.from_byte_list([0x4D, 0x49, 0x2A, 0x00, 0, 0, 0, 0])
+    test.assert(exiforient.tag_value(exifread.read_orientation(jpeg_with(mis_marked))) == 1)
+    var block_bad_magic = fixture(ExifLittleEndian)
+    put16(block_bad_magic, 2, 41, ExifLittleEndian)
+    test.assert(exiforient.tag_value(
+        exifread.read_orientation(jpeg_with(block_bad_magic))) == 1)
+
+    test.case("and bytes that are not a container at all are upright")
+    test.assert(exiforient.tag_value(exifread.read_orientation(jpeg_bare())) == 1)
+    test.assert(exiforient.tag_value(
+        exifread.read_orientation(bytes.from_byte_list([0x47, 0x49, 0x46]))) == 1)
+    test.assert(exiforient.tag_value(exifread.read_orientation(bytes.zeros(64))) == 1)
+
+    test.case("the block's offset is 12 in a JPEG, 0 in a TIFF and nowhere else")
+    match exifread.tiff_offset(jpeg_with(fa))
+        Some(at) => test.assert(at == 12)
+        None     => test.fail("the segment is there")
+    match exifread.tiff_offset(fa)
+        Some(at) => test.assert(at == 0)
+        None     => test.fail("a TIFF is its own block")
+    match exifread.tiff_offset(bytes.zeros(4))
+        None    => test.assert(true)
+        Some(_) => test.fail("zeros are not a container")
+    test.assert(exifread.has_exif(fa))
+    test.assert(exifread.has_exif(jpeg_with(fa)))
+    test.assert(not exifread.has_exif(png_bare()))
+
+// ── a container named wrongly ────────────────────────────────────────
+
+// The eight-byte PNG signature and nothing else.
+fn png_signature_only() -> Bytes
+    bytes.from_byte_list([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+@test
+fn test_a_container_named_wrongly_is_written_as_it_was_named() [io]
+    // `write` takes the container as an argument rather than sniffing,
+    // so a caller that names the wrong one gets the shape it asked for:
+    // a TIFF's own block wrapped in a JPEG segment or an eXIf chunk.
+    // What is asserted is the shape — the length and where the segment
+    // landed — because the metadata inside it is the same block.
+    let fa = fixture(ExifLittleEndian)
+    let d = ok_data(fa)
+    let block_bytes = exifwrite.block_size(d)
+
+    test.case("a TIFF's block wrapped in a JPEG segment")
+    // The marker, the length, `Exif\0\0` and the block, around the two
+    // bytes of the source that were the start of an image: there is no
+    // APP1 segment in a TIFF for `jpeg_without_exif` to take out.
+    let as_jpeg = exifwrite.write(fa, d, ExifContainerJpeg)!
+    test.assert(bytes.len(as_jpeg) == bytes.len(fa) + block_bytes + 10)
+    test.assert(bytes.byte_at(as_jpeg, 0) == Some(0x49))
+    test.assert(bytes.byte_at(as_jpeg, 1) == Some(0x49))
+    test.assert(bytes.byte_at(as_jpeg, 2) == Some(0xFF))
+    test.assert(bytes.byte_at(as_jpeg, 3) == Some(0xE1))
+    test.assert(bytes.byte_at(as_jpeg, 6) == Some(0x45))
+
+    test.case("a TIFF's block as an eXIf chunk appended to a TIFF")
+    // No IHDR to put the chunk after, so it goes on the end: the length
+    // of the first chunk read out of a TIFF's own header is not a
+    // position inside the TIFF.
+    let as_png = exifwrite.write(fa, d, ExifContainerPng)!
+    test.assert(bytes.len(as_png) == bytes.len(fa) * 2 + 12)
+    test.assert(bytes.byte_at(as_png, bytes.len(fa) + 4) == Some(0x65))
+
+    test.case("a JPEG written around nothing at all is the segment alone")
+    let bare = exifwrite.write(bytes.zeros(0), d, ExifContainerJpeg)!
+    test.assert(bytes.len(bare) == block_bytes + 10)
+    test.assert(bytes.byte_at(bare, 0) == Some(0xFF))
+    test.assert(bytes.byte_at(bare, 1) == Some(0xE1))
+
+    test.case("a PNG written around nothing but its signature")
+    let around = exifwrite.write(png_signature_only(), d, ExifContainerPng)!
+    test.assert(bytes.len(around) == 8 + block_bytes + 12)
+    test.assert(bytes.byte_at(around, 12) == Some(0x65))
+
+    test.case("write_sniffed refuses bytes that sniff as nothing")
+    match exifwrite.write_sniffed(bytes.zeros(64), d)
+        Ok(_)  => test.fail("zeros are no container")
+        Err(e) => test.assert(exiffault.code(e) == "unknown_container")
+
+// ── the directories behind pointers, and the note a plan warns about ─
+
+// A block with entries in all five directories: the 0th, the 1st with
+// the thumbnail, the Exif one, the GPS one and the interoperability
+// one, which is what tells a plan's `dropped` pairs apart.
+fn five_directory_data() -> ExifData
+    var d = ok_data(chain_fixture(false))
+    d = with_gps(d, 0x0001, exifvalue.ascii_value("S"))
+    d = with_gps(d, 0x0002, dms_value(51, 30, 0))
+    d = with_gps(d, 0x0003, exifvalue.ascii_value("W"))
+    d = with_gps(d, 0x0004, dms_value(0, 30, 0))
+    d = exifdata.set(d, ExifIfdInterop, 0x0001, exifvalue.ascii_value("R98"))
+    d
+
+@test
+fn test_the_writer_carries_the_directories_that_hang_off_pointers() [io]
+    // Three of the five directories are not on the chain: each hangs
+    // off a pointer entry the writer owns and lays down itself.  A
+    // writer that walked the chain and nothing else would lose the GPS
+    // position, the interoperability description and the Exif
+    // directory with them.
+    let d = five_directory_data()
+
+    test.case("all five directories survive a write and a read")
+    let block = exifwrite.to_tiff_block(d)!
+    let back = ok_data(block)
+    test.assert(exifdata.has_ifd(back, ExifIfdPrimary))
+    test.assert(exifdata.has_ifd(back, ExifIfdExif))
+    test.assert(exifdata.has_ifd(back, ExifIfdGps))
+    test.assert(exifdata.has_ifd(back, ExifIfdInterop))
+    test.assert(exifdata.has_ifd(back, ExifIfdThumbnail))
+
+    test.case("and the position comes back with the sign its own tag carries")
+    match exifdata.gps_degrees(back)
+        Ok(p)    =>
+            match p
+                Some(ll) =>
+                    test.assert(math.abs(ll.0 - (0.0 - 51.5)) < 0.000001)
+                    test.assert(math.abs(ll.1 - (0.0 - 0.5)) < 0.000001)
+                None     => test.fail("both triples were written")
+        Err(err) => test.fail(err.message())
+
+    test.case("and the interoperability description with it")
+    match exifdata.value(back, ExifIfdInterop, 0x0001)
+        Some(v) => test.assert(exifvalue.ascii_text(v) == "R98")
+        None    => test.fail("the interoperability IFD was written")
+
+    test.case("a plan names the directory of every entry a caller dropped")
+    // Five entries, one out of each directory, removed from what the
+    // source holds: the pairs are numbered by the enum's own order, 0
+    // the 0th IFD, 1 the thumbnail's, 2 the Exif one, 3 GPS, 4
+    // interoperability.
+    var after = exifdata.remove(d, ExifIfdPrimary, 0x0112)
+    after = exifdata.remove(after, ExifIfdThumbnail, 0x0201)
+    after = exifdata.remove(after, ExifIfdExif, 0x9000)
+    after = exifdata.remove(after, ExifIfdGps, 0x0002)
+    after = exifdata.remove(after, ExifIfdInterop, 0x0001)
+    let p = exifwrite.plan(block, after, ExifContainerTiff)!
+    test.assert(list.len(p.dropped) == 5)
+    var numbers: [Int] = []
+    for pair in p.dropped
+        list.push(numbers, pair.0)
+    list.sort_by(numbers, n => n)
+    test.assert(list_text(numbers) == "0,1,2,3,4,")
+    test.assert(not exifwrite.is_lossless(p))
+
+// A block with a MakerNote in it, which is the entry a plan warns
+// about: several vendors' notes hold absolute file offsets and stop
+// parsing when they move.
+fn with_maker_note(d: ExifData) -> ExifData
+    exifdata.set(d, ExifIfdExif, 0x927C, ExifBytes(bytes.from_byte_list([1, 2, 3, 4])))
+
+// Whether writing this block into this container would move the note.
+fn note_moves(source: Bytes, d: ExifData, c: ExifContainer) -> Bool
+    let p = exifwrite.plan(source, d, c)!
+    p.maker_note_moves
+
+@test
+fn test_a_plan_finds_the_note_it_warns_about_or_says_it_cannot() [io]
+    // The warning is a comparison of where the note was with where the
+    // rewrite would put it, and every way of failing to make that
+    // comparison is a warning rather than a silence: a rewrite that
+    // cannot compare the two is a rewrite that may have moved the note.
+    let o = ExifLittleEndian
+    let note = with_maker_note(ok_data(fixture(o)))
+    let chain = chain_fixture(false)
+    let file_note = ok_data(chain)
+
+    test.case("a note with no file to compare it against is a warning")
+    test.assert(note_moves(bytes.zeros(64), note, ExifContainerTiff))
+
+    test.case("a block whose byte-order mark is not a mark is a warning too")
+    let mis_marked = bytes.from_byte_list([0x4D, 0x49, 0x2A, 0x00, 0, 0, 0, 0])
+    test.assert(note_moves(jpeg_with(mis_marked), note, ExifContainerTiff))
+
+    test.case("and so is a block whose magic is not 42")
+    var block_bad_magic = fixture(o)
+    put16(block_bad_magic, 2, 41, o)
+    test.assert(note_moves(jpeg_with(block_bad_magic), note, ExifContainerTiff))
+
+    test.case("a block with no Exif-IFD pointer has no note to find")
+    test.assert(note_moves(types_fixture(o), note, ExifContainerTiff))
+
+    test.case("a block whose Exif directory carries no note has none to find")
+    test.assert(note_moves(fixture(o), note, ExifContainerTiff))
+
+    test.case("a directory offset past the end of the file has none either")
+    var far_first = fixture(o)
+    put32(far_first, 4, 4000, o)
+    test.assert(note_moves(far_first, note, ExifContainerTiff))
+
+    test.case("nor has one whose declared entries run past the end of the file")
+    var shallow = fixture(o)
+    put32(shallow, 4, 106, o)
+    test.assert(note_moves(shallow, note, ExifContainerTiff))
+
+    test.case("an entry whose type code is not a type reads as no bytes")
+    var not_a_type = fixture(o)
+    put16(not_a_type, 48, 99, o)   // the Exif-IFD pointer's own type
+    test.assert(note_moves(not_a_type, note, ExifContainerTiff))
+
+    test.case("a file with a note in it is compared, and a TIFF does not move it")
+    test.assert(not note_moves(chain, file_note, ExifContainerTiff))
+
+    test.case("but writing it into a JPEG or a PNG does move it")
+    test.assert(note_moves(chain, file_note, ExifContainerJpeg))
+    test.assert(note_moves(chain, file_note, ExifContainerPng))
+
+// ── the narrow write, and what it refuses ────────────────────────────
+
+@test
+fn test_the_narrow_orientation_write_refuses_what_it_cannot_edit() [io]
+    test.case("a block whose byte-order mark is not a mark is refused by name")
+    let mis_marked = bytes.from_byte_list([0x4D, 0x49, 0x2A, 0x00, 0, 0, 0, 0])
+    match exifwrite.set_orientation(jpeg_with(mis_marked), ExifRotate90)
+        Ok(_)  => test.fail("MI is not a byte order")
+        Err(e) => test.assert(exiffault.code(e) == "bad_byte_order")
+
+    test.case("a 0th directory that runs past the end of the file has no entry")
+    var shallow = fixture(ExifLittleEndian)
+    put32(shallow, 4, 92, ExifLittleEndian)
+    match exifwrite.set_orientation(shallow, ExifRotate90)
+        Ok(_)  => test.fail("there is no orientation entry to edit")
+        Err(e) => test.assert(exiffault.code(e) == "no_exif")
+
+    test.case("and neither has a file with no orientation tag at all")
+    let no_tag = bytes.slice(fixture(ExifLittleEndian), 0, 34)
+    match exifwrite.set_orientation(no_tag, ExifRotate90)
+        Ok(_)  => test.fail("there is no orientation entry to edit")
+        Err(e) => test.assert(exiffault.code(e) == "no_exif")

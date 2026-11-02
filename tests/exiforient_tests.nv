@@ -1,9 +1,6 @@
 // exiforient_tests.nv — the eight orientations of tag 0x0112, against
 // EXIF 2.32 section 4.6.4.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: exif-nv.exiforient.<fn>`.
-//
 // THE FOUR THAT MIRROR are what this suite is mostly about.  Most
 // implementations handle 1, 3, 6 and 8 and silently mishandle 2, 4, 5
 // and 7, which scanners and some phone front cameras write.
